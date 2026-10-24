@@ -92,7 +92,10 @@ You are responsible for proper operational security (OPSEC).
 
 
 ## License
-MIT
+
+This repository's original code, configuration templates and documentation are licensed under the [MIT License](LICENSE). Keep the copyright and permission notice when redistributing copies or substantial portions.
+
+Third-party software and any third-party materials retain their own licenses and copyright notices. This license does not relicense Xray, Grafana, Loki or other dependencies.
 
 ## Disclaimer
 
