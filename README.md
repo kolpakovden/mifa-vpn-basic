@@ -1,114 +1,275 @@
-## Mifa-VPN-basic
+## MIFA VPN Basic
 
 ![Version](https://img.shields.io/badge/version-v1.0.1-blue)
 [![License](https://img.shields.io/badge/license-Free_Noncommercial-blue)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Ubuntu-orange)
+![Platform](https://img.shields.io/badge/platform-Ubuntu_22.04_|_24.04_|_26.04-orange)
 
-Minimal Xray (VLESS + Reality) installer for a **clean Ubuntu VPS**. The installer's security and compatibility hardening is in progress; it is not yet a general-purpose migration tool.
+Минимальный установщик Xray (VLESS + REALITY) для **чистого Ubuntu VPS**.
+Basic - самостоятельная публичная редакция: она не зависит от приватного
+MIFA VPN Core и архивной MIFA VPN Platform и работает без них.
 
-> Default RU-friendly port: **8443**  
-> Supports modern **Xray v26+ (Password/pbk format)**  
-> Clean, minimal, no telemetry.
-
-### Looking for Advanced Features?
-
-If you need:
-
-- Telegram-based user management  
-- Monitoring (Grafana + Prometheus + Loki)  
-- Modular architecture  
-- Production-grade observability  
-
-The advanced architecture is maintained in **[MIFA VPN Core](https://github.com/kolpakovden/mifa-vpn-core)** (currently a private development repository). The former [MIFA VPN Platform](https://github.com/kolpakovden/mifa-vpn-platform) is preserved only for historical reference.
+> **Статус.** Установщик проходит доработку безопасности
+> ([Issue #1](https://github.com/kolpakovden/mifa-vpn-basic/issues/1)).
+> Автоматические проверки выполняются в CI в контейнерах Ubuntu 22.04, 24.04 и 26.04.
+> Проверка настоящим клиентом с другого устройства и из другой сети ещё не проводилась:
+> до неё и до нового релиза используйте Basic только на тестовом или новом сервере.
 
 ---
 
-## Features
+## Что делает установщик
 
-```
-Minimal and clean Xray installer
-VLESS + Reality configuration
-RU-friendly default port: 8443
-Configurable port (--port, --443, --8443)
-Configurable SNI/target
-Non-interactive mode (--non-interactive)
-Automatic UUID generation
-Automatic Reality key generation
-Supports Xray v26+ (Password/pbk format)
-systemd service integration
-Ready-to-import VLESS URI output
-```
+1. **Preflight** - проверяет систему и ничего не меняет: ОС, архитектуру, systemd,
+   команды, место на диске, занятость порта, существующий Xray, firewall, доступ к
+   релизу Xray и пригодность REALITY-цели.
+2. **План** - печатает все действия, файлы, права и источник Xray.
+3. Скачивает Xray **закреплённой версии** только из официального релиза
+   [XTLS/Xray-core](https://github.com/XTLS/Xray-core/releases) и проверяет SHA256
+   по значению, закреплённому в скрипте, и по `.dgst` релиза. `curl | bash` и
+   сторонние APT-репозитории не используются.
+4. Генерирует UUID, ключи REALITY и shortId; открытый ключ сверяется независимым
+   вычислением через OpenSSL.
+5. Собирает конфиг во временном каталоге и проверяет его `xray run -test`.
+6. Устанавливает файлы атомарно, записывая каждое изменение в журнал.
+   **При любой ошибке выполняется автоматический откат.**
+7. Запускает сервис от отдельного пользователя `xray` с ограничениями systemd и
+   проверяет, что порт слушает Xray, а REALITY отвечает настоящим сертификатом цели.
+8. Сохраняет данные клиента и ссылку `vless://` в файл, доступный только root.
 
-## Reality Key Compatibility
-This installer supports both:
-Legacy Xray output
-```
-Private key
-Public key
-```
-Xray v26+ output
-```
-PrivateKey
-Password
-```
-The script automatically detects and parses the correct format.
+## Требования
 
-## Installation
+- Новый VPS с Ubuntu **22.04, 24.04 или 26.04**, архитектура x86_64 или arm64.
+  Другие версии и Debian не проверяются (preflight выдаст предупреждение).
+- systemd как init-система. Контейнеры без systemd, OpenVZ и WSL не подходят.
+- Доступ root или `sudo`.
+- Не менее 200 МБ свободного места во временном каталоге и 100 МБ в `/usr/local`.
+- HTTPS-доступ с сервера к `github.com` (загрузка Xray).
+- Свободный TCP-порт и открытый доступ к нему у провайдера.
+- Домен для REALITY (см. ниже).
 
-**Important: fresh hosts only.** The installer now rejects a machine with an existing Xray executable, configuration or running Xray service before attempting to write a config. Never run it to update a production VPN. Do not assume a fixed SNI/target is valid for every network; verify it before using a profile.
+На сервере **не должно быть** Xray, панелей x-ui/3x-ui/Marzban и других установок
+Xray: Basic не изменяет и не мигрирует существующие конфигурации.
 
-Recommended: start with a fresh Ubuntu VPS. Allow the selected TCP port in your VPS provider firewall and any local firewall. Save the generated VLESS link securely. Test from a separate device/network before relying on it.
+## Выбор домена для REALITY
+
+REALITY маскирует подключение под TLS-соединение с реальным сайтом. Домен задаётся
+явно через `--sni`; установщик **не выбирает домен молча**. Перед установкой
+проверяется, что цель (`--target`, по умолчанию `ДОМЕН:443`):
+
+- разрешается в DNS и не указывает на локальный, частный или служебный адрес
+  (иначе REALITY открыл бы внутренний сервис из интернета);
+- не указывает на сам сервер с тем же портом (петля);
+- поддерживает TLS 1.3, обмен ключами X25519 и HTTP/2 (ALPN h2);
+- предъявляет действительный сертификат для этого домена.
+
+Дополнительно выдаётся предупреждение, если главная страница перенаправляет на
+другой домен. Проверка выполняется с самого сервера, так как именно он
+соединяется с целью. Успешная проверка не гарантирует отсутствие блокировок:
+выбирайте популярный сайт, доступный из страны сервера, и проверяйте подключение
+клиентом.
+
+## Быстрый старт
 
 ```bash
 git clone https://github.com/kolpakovden/mifa-vpn-basic.git
+```
+
+```bash
 cd mifa-vpn-basic
-sudo bash install.sh --port 8443 --sni vpn.example.com --target vpn.example.com:443
 ```
 
-Replace `vpn.example.com` with a **verified compatible REALITY handshake target**; this is a parameter example, not a ready-to-use SNI. An automated compatibility test will be added before the next public release.
+Проверка без изменений (можно без root, но часть проверок будет ограничена):
 
-The script currently contains legacy installation paths and does not yet implement complete rollback. Track production-readiness work in [Issue #1](https://github.com/kolpakovden/mifa-vpn-basic/issues/1).
-
-### Legacy quick start
-
-```
-git clone https://github.com/kolpakovden/MIFA-VPN-basic.git
-cd MIFA-VPN-basic
-sudo bash install.sh
+```bash
+sudo bash install.sh --preflight --sni www.example.com --port 443
 ```
 
-## Security Note
+План и пробный прогон: скачивание и проверка Xray, генерация и проверка конфига во
+временном каталоге. Системные файлы не меняются:
 
-Reality is a transport obfuscation layer, not a full anonymity system.
-This project:
+```bash
+sudo bash install.sh --dry-run --sni www.example.com --port 443
 ```
-Protects traffic from simple DPI
-Obfuscates TLS handshake
-Helps bypass censorship in restrictive networks
-```
-This project does NOT:
-```
-Provide anonymity like Tor
-Protect against endpoint compromise
-Prevent server-side logging
-Protect against traffic correlation attacks
-```
-You are responsible for proper operational security (OPSEC).
 
-## Edition Comparison
+Установка (замените `www.example.com` на выбранный домен):
 
-| Feature | Basic | Core (private development) |
-|----------|--------|-----------|
-| Xray (VLESS + Reality) |   ✅ |   ✅ |
-| Telegram Bot |   ❌ |   ✅ |
-| Monitoring Stack |   ❌ |   ✅ |
-| Architecture | Monolithic | Modular |
-| Target | Simple Setup | Production Infra |
+```bash
+sudo bash install.sh --sni www.example.com --port 443
+```
 
+Запускайте установку в `tmux` или `screen`: при обрыве SSH прерванную установку
+придётся откатывать вручную командой `--rollback`.
+
+Ссылка для клиента печатается в конце и сохраняется в
+`/var/lib/mifa-vpn-basic/client.txt`. Снова показать её:
+
+```bash
+sudo cat /var/lib/mifa-vpn-basic/client.txt
+```
+
+## Режимы и параметры
+
+| Параметр | Назначение |
+|----------|------------|
+| `--preflight` | Только проверки, без изменений. Код 0 - можно устанавливать. |
+| `--plan` | Проверки и подробный план, без изменений. |
+| `--dry-run` | Проверки, план, загрузка и проверка SHA256 Xray, генерация и `xray run -test` конфига во временном каталоге. Системные файлы не меняются, временный каталог удаляется. |
+| `--rollback` | Откат прерванной установки по журналу. |
+| `--sni DOMAIN` | Домен REALITY. Обязателен для установки. |
+| `--target HOST:PORT` | Цель REALITY, по умолчанию `DOMAIN:443`. |
+| `--port N`, `--443`, `--8443` | Входящий TCP-порт, по умолчанию 8443. |
+| `--server-address A` | Адрес сервера в ссылке. По умолчанию внешний IPv4 определяется через `api.ipify.org`. |
+| `--non-interactive` | Без вопросов. |
+| `-y`, `--yes` | Не спрашивать подтверждение. |
+| `--no-print-secrets` | Не печатать UUID, ключ и ссылку, только записать в файл. |
+| `--xray-zip FILE` | Локальный архив Xray (SHA256 проверяется так же). |
+| `--xray-version V` и `--xray-sha256 H` | Другая версия Xray. Без SHA256 не принимается. |
+
+О порте: Xray предупреждает, что REALITY не на 443 заметнее для блокировок.
+Порт 8443 оставлен по умолчанию для совместимости с прежними версиями Basic;
+при свободном 443 лучше использовать `--443`.
+
+## Что устанавливается
+
+| Путь | Права | Назначение |
+|------|-------|------------|
+| `/usr/local/bin/xray` | `root:root 0755` | бинарник Xray закреплённой версии |
+| `/usr/local/etc/xray/config.json` | `root:xray 0640` | конфиг с закрытым ключом |
+| `/etc/systemd/system/xray.service` | `root:root 0644` | unit с ограничениями systemd |
+| `/var/lib/mifa-vpn-basic/client.txt` | `root:root 0600` | данные клиента и ссылка |
+| `/var/lib/mifa-vpn-basic/manifest` | `root:root 0600` | список файлов установки для `uninstall.sh` |
+| пользователь `xray` | без shell и home | от него работает сервис |
+
+Пакет `unzip` ставится через `apt-get`, только если нет ни `unzip`, ни `python3`.
+SSH, firewall и другие сервисы не изменяются.
+
+## Порты и firewall
+
+- Установщик **не открывает порт** автоматически. Если активен `ufw`, preflight
+  подскажет команду, например `sudo ufw allow 443/tcp`.
+- Firewall провайдера (security group в панели VPS) отсюда проверить нельзя:
+  откройте выбранный TCP-порт там вручную.
+- Проверяйте подключение с другого устройства и из другой сети, а не с самого сервера.
+
+## Безопасность
+
+- Целостность Xray: закреплённые версия и SHA256; при несовпадении архив удаляется,
+  система не изменяется. Версия бинарника проверяется после распаковки.
+- Журнал изменений и автоматический откат; `--rollback` выполняет только
+  допустимые записи для путей Basic.
+- Сервис работает от пользователя `xray`, с `NoNewPrivileges`, `ProtectSystem=strict`,
+  `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` и другими ограничениями.
+- Конфиг с закрытым ключом читается только root и группой `xray`.
+- Журнал посещений Xray (`access`) отключён, ошибки пишутся в journald с ротацией.
+- Клиентам VPN закрыт доступ к localhost сервера, metadata API облака и частным
+  сетям: Xray v26 блокирует такие адреса по умолчанию, Basic дублирует запрет
+  явным правилом маршрутизации.
+- Телеметрии нет. Единственный внешний запрос, кроме загрузки Xray и проверки цели, -
+  определение внешнего IP через `api.ipify.org`; его отключает `--server-address`.
+
+REALITY - это маскировка транспорта, а не система анонимности. Basic:
+
+```
+Защищает трафик от простого DPI
+Маскирует TLS-рукопожатие под реальный сайт
+Помогает обходить блокировки
+```
+
+Basic НЕ:
+
+```
+Даёт анонимность уровня Tor
+Защищает от компрометации устройства
+Скрывает трафик от владельца сервера
+Защищает от корреляции трафика
+```
+
+За операционную безопасность отвечает пользователь.
+
+## Повторная установка и обновление
+
+- Повторный запуск `install.sh` на сервере с Basic **отклоняется**: рабочий конфиг,
+  ключи и сервис не меняются. Preflight подскажет, где взять данные клиента.
+- Переустановка с новыми ключами: `sudo bash uninstall.sh`, затем `install.sh`.
+  Старые ссылки клиентов перестанут работать.
+- Переустановка с прежними ключами: см. [docs/RECOVERY.md](docs/RECOVERY.md#4-вернуть-прежние-ключи-и-ссылку).
+- Обновление Xray выполняется новой версией Basic с новым закреплённым SHA256.
+  Ручная замена бинарника не поддерживается.
+
+## Удаление
+
+```bash
+sudo bash uninstall.sh
+```
+
+Перед удалением конфиг и данные клиента копируются в
+`/var/backups/mifa-vpn-basic/uninstall-<время>/`. Удаляются только файлы из
+манифеста Basic. Xray, установленный не Basic, не удаляется; для установок
+Basic до версии 1.1 предусмотрен `sudo bash uninstall.sh --force` с резервной копией.
+
+## Восстановление и проблемы
+
+Подробно - в [docs/RECOVERY.md](docs/RECOVERY.md). Кратко:
+
+| Ситуация | Что делать |
+|----------|-----------|
+| Установка завершилась ошибкой | Откат выполнен автоматически. Исправьте причину из сообщения и запустите снова. |
+| Обрыв SSH или перезагрузка во время установки | `sudo bash install.sh --rollback`, затем установка заново. |
+| Сервис не запускается | `sudo journalctl -u xray -n 100` и `sudo -u xray /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json` |
+| Клиент не подключается | Порт у провайдера и в `ufw`, адрес в ссылке, время на устройстве, тот же SNI. |
+| Потеряна ссылка | `sudo cat /var/lib/mifa-vpn-basic/client.txt` |
+
+## Тестирование
+
+- `tests/unit.sh` - функции установщика: валидация, разбор форматов `xray x25519`,
+  вычисление ключа, ссылка VLESS, конфиг, защита журнала.
+- `tests/reality_probe.sh` - проверка REALITY-цели против локального TLS-сервера:
+  TLS 1.2, нет HTTP/2, нет X25519, чужой и самоподписанный сертификат.
+- `tests/guards.sh` - отказ без изменений: существующий Xray, занятый порт,
+  прерванная установка, частный target, подменённый архив, вредоносный журнал.
+- `tests/nochange.sh` - `--preflight`, `--plan`, `--dry-run` не меняют систему.
+- `tests/e2e_systemd.sh` - полный цикл в контейнере с systemd: установка, права,
+  подключение настоящим клиентом Xray по ссылке, блокировка localhost, отказ
+  повторной установки, откат на каждом шаге, SIGKILL и `--rollback`, удаление
+  и восстановление прежних ключей.
+
+Тесты, меняющие систему, запускаются только в одноразовых контейнерах:
+
+```bash
+bash tests/run-docker.sh all 24.04
+```
+
+CI повторяет их для Ubuntu 22.04, 24.04 и 26.04 и сверяет закреплённый SHA256 Xray
+с официальным релизом. Клиент и сервер в e2e работают в одном контейнере: это не
+заменяет проверку с внешнего устройства и сети.
+
+## Совместимость форматов ключей Xray
+
+Установщик разбирает все известные форматы вывода `xray x25519`:
+
+```
+Private key / Public key                 (Xray 1.x)
+PrivateKey / Password                    (Xray v25 - v26)
+PrivateKey / Password (PublicKey)        (Xray v26.11+)
+```
+
+## Сравнение редакций
+
+| Возможность | Basic | Core (приватная разработка) |
+|-------------|-------|-----------------------------|
+| Xray (VLESS + REALITY) | ✅ | ✅ |
+| Telegram-бот | ❌ | ✅ |
+| Мониторинг (Grafana, Prometheus, Loki) | ❌ | ✅ |
+| Архитектура | Один скрипт | Модульная |
+| Назначение | Простая установка | Производственная инфраструктура |
+
+Расширенная архитектура развивается в **[MIFA VPN Core](https://github.com/kolpakovden/mifa-vpn-core)**
+(сейчас приватный репозиторий). Basic от него не зависит. Прежняя
+[MIFA VPN Platform](https://github.com/kolpakovden/mifa-vpn-platform) сохранена только
+для истории.
 
 ## License
 
-Цель проекта — **бесплатная доступность для всех без коммерческой эксплуатации**.
+Цель проекта - **бесплатная доступность для всех без коммерческой эксплуатации**.
 
 С 24 октября 2026 года новые разрешения на собственные материалы проекта предоставляются по [MIFA Free Noncommercial License 1.0](LICENSE).
 
@@ -124,9 +285,9 @@ You are responsible for proper operational security (OPSEC).
 
 Это собственная некоммерческая лицензия с доступными исходниками, а не MIT и не стандартная open source лицензия. Материалы предоставляются «как есть», без гарантий.
 
-## Disclaimer
+## Отказ от ответственности
 
 ```
-This project is intended for infrastructure automation and educational purposes.
-Ensure compliance with local laws and regulations in your jurisdiction.
+Проект предназначен для автоматизации инфраструктуры и обучения.
+Соблюдайте законы и правила своей юрисдикции.
 ```
