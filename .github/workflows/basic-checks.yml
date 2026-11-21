@@ -1,0 +1,40 @@
+name: Basic installer checks
+
+on:
+  push:
+    branches: [main, "hardening/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bash-static-and-fresh-host-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax and help
+        run: |
+          bash -n install.sh
+          bash install.sh --help > "$RUNNER_TEMP/help.txt"
+          grep -q -- '--non-interactive' "$RUNNER_TEMP/help.txt"
+      - name: Reject malformed port before privilege checks
+        run: |
+          set +e
+          output="$(bash install.sh --non-interactive --port 0 2>&1)"
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+          echo "$output" | grep -q 'Некорректный порт'
+      - name: Reject pre-existing Xray without changing host
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/mock-bin"
+          printf '#!/usr/bin/env sh\nexit 0\n' > "$RUNNER_TEMP/mock-bin/xray"
+          chmod +x "$RUNNER_TEMP/mock-bin/xray"
+          set +e
+          output="$(sudo env PATH="$RUNNER_TEMP/mock-bin:$PATH" bash install.sh --non-interactive --port 62441 2>&1)"
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+          echo "$output" | grep -q 'существующая установка Xray'
