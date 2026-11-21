@@ -217,3 +217,5 @@ class Server(socketserver.ThreadingTCPServer):
 Server((addr, port), Handler).serve_forever()' "$1" "$2" "$3" >/dev/null 2>&1 &
   echo $!
 }
+
+user_exists() { id -u "$1" >/dev/null 2>&1; }

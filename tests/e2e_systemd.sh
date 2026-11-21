@@ -92,7 +92,7 @@ assert_clean_host() {
   for p in /usr/local/bin/xray /usr/local/etc/xray /etc/systemd/system/xray.service /var/lib/mifa-vpn-basic; do
     assert_false "$1: нет $p" test -e "$p"
   done
-  assert_false "$1: нет пользователя xray" id -u xray
+  assert_false "$1: нет пользователя xray" user_exists xray
   assert_eq "$1: unit xray.service не загружен" "not-found" "$(systemctl show -p LoadState --value xray.service)"
   assert_eq "$1: порт ${PORT} свободен" "" "$(ss -Htln "sport = :${PORT}")"
 }
@@ -209,7 +209,8 @@ assert_true "xray run -test от имени xray" runuser -u xray -- /usr/local/
 assert_eq "версия установленного Xray" "Xray ${PINNED_VER#v}" "$(/usr/local/bin/xray version | head -n1 | cut -d' ' -f1-2)"
 probe="$(openssl s_client -connect "127.0.0.1:${PORT}" -servername "$SNI" -verify_hostname "$SNI" </dev/null 2>&1)"
 assert_contains "неаутентифицированный TLS получает сертификат цели" "$probe" "Verify return code: 0 (ok)"
-assert_contains "сертификат цели: CN" "$probe" "CN = ${SNI}"
+# OpenSSL 3.0 печатает "CN = x", OpenSSL 3.5 (Ubuntu 26.04) - "CN=x".
+assert_true "сертификат цели: CN" grep -Eq "CN ?= ?${SNI//./\\.}" <<<"$probe"
 
 t_section "Ссылка клиента и подключение настоящим клиентом Xray"
 parse_vless_uri "$(cval vless_uri)"
@@ -295,6 +296,24 @@ for step in after_user after_binary after_config after_unit after_enable after_s
   assert_contains "${step}: откат выполнен" "$out" "Откат завершён: изменения установщика отменены"
   assert_clean_host "$step"
 done
+
+t_section "Откат восстанавливает ранее существовавший файл из резервной копии"
+install -d -m 700 /var/lib/mifa-vpn-basic
+printf 'mifa_basic_version=stale\n' >/var/lib/mifa-vpn-basic/manifest
+chmod 600 /var/lib/mifa-vpn-basic/manifest
+stale_sha="$(sha256sum /var/lib/mifa-vpn-basic/manifest | awk '{print $1}')"
+out="$(MIFA_BASIC_TEST_MODE=1 MIFA_BASIC_TEST_FAIL_AT=before_commit bash "$INSTALL_SH" "${BASE[@]}" "${SRC[@]}" 2>&1)"; rc=$?
+assert_rc "сбой перед фиксацией" 97 "$rc"
+assert_contains "файл сохранён перед заменой" "$out" "Резервная копия: /var/lib/mifa-vpn-basic/manifest"
+assert_contains "файл восстановлен при откате" "$out" "Восстановлен /var/lib/mifa-vpn-basic/manifest"
+assert_eq "прежний манифест восстановлен байт в байт" "$stale_sha" "$(sha256sum /var/lib/mifa-vpn-basic/manifest | awk '{print $1}')"
+assert_eq "права восстановленного файла" "600 root root" "$(stat -c '%a %U %G' /var/lib/mifa-vpn-basic/manifest)"
+assert_true "существовавший каталог состояния не удалён" test -d /var/lib/mifa-vpn-basic
+assert_false "бинарник удалён" test -e /usr/local/bin/xray
+assert_false "пользователь xray удалён" user_exists xray
+assert_eq "unit не загружен" "not-found" "$(systemctl show -p LoadState --value xray.service)"
+rm -rf /var/lib/mifa-vpn-basic /var/backups/mifa-vpn-basic
+assert_clean_host "после очистки"
 
 t_section "Внедрение сбоя без MIFA_BASIC_TEST_MODE не действует"
 out="$(MIFA_BASIC_TEST_FAIL_AT=after_user bash "$INSTALL_SH" "${BASE[@]}" "${SRC[@]}" 2>&1)"; rc=$?

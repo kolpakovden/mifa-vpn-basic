@@ -20,7 +20,7 @@ assert_clean() { # префикс сообщения
   for p in "${state_paths[@]}"; do
     assert_false "$1: нет $p" test -e "$p"
   done
-  assert_false "$1: нет пользователя xray" id -u xray
+  assert_false "$1: нет пользователя xray" user_exists xray
 }
 
 run_install() { bash "$INSTALL_SH" "$@" 2>&1; }
@@ -120,7 +120,7 @@ assert_rc_nonzero "откат сообщает о пропущенных зап�
 assert_contains "предупреждение о недопустимой записи" "$out" "Пропущена недопустимая запись"
 assert_eq "/etc/passwd не тронут" "$passwd_before" "$(sha256sum /etc/passwd)"
 assert_true "/etc/shadow на месте" test -e /etc/shadow
-assert_true "root на месте" id -u root
+assert_true "root на месте" user_exists root
 assert_false "допустимая запись выполнена" test -e /usr/local/bin/xray
 assert_false "журнал удалён" test -e /var/lib/mifa-vpn-basic/journal.inprogress
 assert_clean "после --rollback"
