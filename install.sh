@@ -183,6 +183,16 @@ need_cmd systemctl
 need_cmd sed
 need_cmd tr
 
+# Basic is a fresh-host installer. Do not modify an existing Xray deployment.
+# Installing into an occupied machine needs an explicit migration procedure.
+if command -v xray >/dev/null 2>&1 \
+   || [[ -e /usr/local/etc/xray/config.json ]] \
+   || [[ -e /etc/xray/config.json ]] \
+   || systemctl is-active --quiet xray; then
+  err "Обнаружена существующая установка Xray. Basic предназначен только для чистого VPS; действующий конфиг не изменён."
+  exit 1
+fi
+
 if ! is_port_free "$PORT"; then
   err "Порт ${PORT} занят. Освободи его и повтори."
   exit 1
