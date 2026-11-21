@@ -4,37 +4,91 @@ on:
   push:
     branches: [main, "hardening/**"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: basic-checks-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  bash-static-and-fresh-host-guard:
-    runs-on: ubuntu-latest
+  lint:
+    name: shellcheck и синтаксис
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Syntax and help
+      - name: bash -n
         run: |
-          bash -n install.sh
-          bash install.sh --help > "$RUNNER_TEMP/help.txt"
-          grep -q -- '--non-interactive' "$RUNNER_TEMP/help.txt"
-      - name: Reject malformed port before privilege checks
+          for f in install.sh uninstall.sh tests/*.sh; do bash -n "$f"; done
+      - name: shellcheck
         run: |
-          set +e
-          output="$(bash install.sh --non-interactive --port 0 2>&1)"
-          rc=$?
-          set -e
-          test "$rc" -ne 0
-          echo "$output" | grep -q 'Некорректный порт'
-      - name: Reject pre-existing Xray without changing host
-        shell: bash
+          shellcheck --version
+          shellcheck -x -S style install.sh uninstall.sh tests/*.sh
+
+  xray-pin:
+    name: Сверка закреплённого Xray с релизом
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Скачать архивы и сверить SHA256 и .dgst
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tests/check-xray-pin.sh "$RUNNER_TEMP/xray"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xray-release
+          path: ${{ runner.temp }}/xray/Xray-linux-64.zip
+          retention-days: 3
+
+  tests:
+    name: Тесты без systemd (Ubuntu ${{ matrix.ubuntu }})
+    needs: [lint, xray-pin]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ["22.04", "24.04", "26.04"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: xray-release
+          path: ${{ runner.temp }}/xray
+      - name: unit
+        run: MIFA_TEST_XRAY_ZIP_HOST="$RUNNER_TEMP/xray/Xray-linux-64.zip" bash tests/run-docker.sh unit "${{ matrix.ubuntu }}"
+      - name: REALITY-проверка против локального TLS-сервера
+        run: MIFA_TEST_XRAY_ZIP_HOST="$RUNNER_TEMP/xray/Xray-linux-64.zip" bash tests/run-docker.sh reality "${{ matrix.ubuntu }}"
+      - name: Отказы без изменения системы
+        run: MIFA_TEST_XRAY_ZIP_HOST="$RUNNER_TEMP/xray/Xray-linux-64.zip" bash tests/run-docker.sh guards "${{ matrix.ubuntu }}"
+      - name: preflight, plan и dry-run не меняют систему
+        run: MIFA_TEST_XRAY_ZIP_HOST="$RUNNER_TEMP/xray/Xray-linux-64.zip" bash tests/run-docker.sh nochange "${{ matrix.ubuntu }}"
+      - name: preflight, plan и dry-run с настоящей загрузкой Xray
         run: |
-          mkdir -p "$RUNNER_TEMP/mock-bin"
-          printf '#!/usr/bin/env sh\nexit 0\n' > "$RUNNER_TEMP/mock-bin/xray"
-          chmod +x "$RUNNER_TEMP/mock-bin/xray"
-          set +e
-          output="$(sudo env PATH="$RUNNER_TEMP/mock-bin:$PATH" bash install.sh --non-interactive --port 62441 2>&1)"
-          rc=$?
-          set -e
-          test "$rc" -ne 0
-          echo "$output" | grep -q 'существующая установка Xray'
+          # Без локального архива: установщик сам скачивает и проверяет Xray.
+          MIFA_NOCHANGE_EXPECT_SANDBOX=1 bash tests/run-docker.sh nochange "${{ matrix.ubuntu }}"
+
+  e2e:
+    name: E2E в контейнере с systemd (Ubuntu ${{ matrix.ubuntu }})
+    needs: [lint, xray-pin]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ["22.04", "24.04", "26.04"]
+    env:
+      # Первая установка в e2e скачивает Xray сама; публичная цель проверяет
+      # REALITY с настоящим сайтом и выход в интернет через туннель.
+      MIFA_E2E_PUBLIC_SNI: www.microsoft.com
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: xray-release
+          path: ${{ runner.temp }}/xray
+      - name: cgroup на раннере
+        run: stat -fc %T /sys/fs/cgroup
+      - name: e2e
+        run: MIFA_TEST_XRAY_ZIP_HOST="$RUNNER_TEMP/xray/Xray-linux-64.zip" bash tests/run-docker.sh e2e "${{ matrix.ubuntu }}"
