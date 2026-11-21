@@ -1,0 +1,154 @@
+name: Rollback baseline (expected failures)
+
+on:
+  # TEMPORARY bootstrap/fallback. An ordinary push must not run any jobs.
+  # Keep until dispatch availability has been checked separately via API.
+  push:
+    branches: [experiment/deepseek-rollback]
+    paths: [.github/workflows/rollback-baseline.yml]
+  workflow_dispatch:
+    inputs:
+      ubuntu:
+        description: Ubuntu container version
+        type: choice
+        options: ['24.04', '22.04', '26.04', all]
+        required: true
+        default: '24.04'
+      scenarios:
+        description: 'smoke (six agreed cases), all, or comma-separated catalog names'
+        type: string
+        required: true
+        default: smoke
+      run_systemd:
+        description: Also run the privileged real-systemd regression
+        type: boolean
+        required: true
+        default: false
+      disposable_linux_vm:
+        description: 'Confirm privileged systemd tests on disposable GitHub-hosted Linux VMs (NOT Docker isolation)'
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+# Independent of basic-checks: known P1 failures must never gate that workflow.
+concurrency:
+  group: rollback-baseline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  catalog:
+    # Never interpolate the commit message into shell code. This is only a gate;
+    # baseline_plan.py validates the event again and fixes the push matrix.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/experiment/deepseek-rollback' &&
+       github.event.deleted == false && contains(github.event.head_commit.message, '[baseline-smoke]'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      scenarios: ${{ steps.catalog.outputs.scenarios }}
+      versions: ${{ steps.catalog.outputs.versions }}
+      run_systemd: ${{ steps.catalog.outputs.run_systemd }}
+      profile: ${{ steps.catalog.outputs.profile }}
+    steps:
+      - name: Require GitHub-hosted Linux
+        run: |
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted && "$RUNNER_OS" == Linux ]]
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate event and select scenarios without running installer/tests
+        id: catalog
+        run: |
+          scenarios="$(bash tests/rollback_regressions.sh --list)"
+          printf '%s\n' "$scenarios" | python3 tests/baseline_plan.py >> "$GITHUB_OUTPUT"
+
+  rollback:
+    name: Ubuntu ${{ matrix.ubuntu }} / ${{ matrix.scenario }}
+    needs: catalog
+    if: needs.catalog.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        ubuntu: ${{ fromJSON(needs.catalog.outputs.versions) }}
+        scenario: ${{ fromJSON(needs.catalog.outputs.scenarios) }}
+    steps:
+      - name: Require GitHub-hosted Linux
+        run: |
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted && "$RUNNER_OS" == Linux ]]
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run one scenario in a fresh unprivileged container
+        env:
+          MIFA_ROLLBACK_CASE: ${{ matrix.scenario }}
+          MIFA_TEST_TIMEOUT: '300'
+          MIFA_BASELINE_PROFILE: ${{ needs.catalog.outputs.profile }}
+        # No continue-on-error: expected failures remain failed jobs.
+        run: bash tests/run-ci-docker.sh rollback "${{ matrix.ubuntu }}" "$RUNNER_TEMP/baseline-results"
+      - name: Record actual baseline result
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/baseline-results/summary.md" ]]; then
+            cat "$RUNNER_TEMP/baseline-results/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No baseline result: setup failed or execution was interrupted; NOT a pass.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: baseline-${{ matrix.ubuntu }}-${{ matrix.scenario }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/baseline-results/
+          retention-days: 7
+          if-no-files-found: error
+
+  systemd:
+    name: Ubuntu ${{ matrix.ubuntu }} / systemd-enable-without-stop
+    needs: catalog
+    # A push can NEVER authorize privileged tests, even with the smoke marker.
+    if: >-
+      github.event_name == 'workflow_dispatch' && needs.catalog.outputs.run_systemd == 'true' &&
+      inputs.run_systemd == true && inputs.disposable_linux_vm == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        ubuntu: ${{ fromJSON(needs.catalog.outputs.versions) }}
+    steps:
+      - name: Require disposable GitHub-hosted Linux
+        env:
+          VM_CONFIRMED: ${{ inputs.disposable_linux_vm }}
+        run: |
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted && "$RUNNER_OS" == Linux && "$VM_CONFIRMED" == true ]]
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run real systemd baseline in a privileged container
+        env:
+          MIFA_TEST_TIMEOUT: '300'
+          MIFA_BASELINE_PROFILE: ${{ needs.catalog.outputs.profile }}
+        # Privileged containers can affect their host. This VM must be disposable.
+        run: bash tests/run-ci-docker.sh rollback-systemd "${{ matrix.ubuntu }}" "$RUNNER_TEMP/baseline-results" --disposable-linux-vm
+      - name: Record actual baseline result
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/baseline-results/summary.md" ]]; then
+            cat "$RUNNER_TEMP/baseline-results/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No baseline result: setup failed or execution was interrupted; NOT a pass.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: baseline-${{ matrix.ubuntu }}-systemd-enable-without-stop-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/baseline-results/
+          retention-days: 7
+          if-no-files-found: error

@@ -156,6 +156,235 @@ assert_false "userdel root запрещён" journal_entry_allowed userdel root 
 assert_false "stop sshd запрещён" journal_entry_allowed stop ssh.service ""
 assert_false "restore из чужого пути запрещён" journal_entry_allowed restore /usr/local/etc/xray/config.json /tmp/evil
 assert_false "неизвестное действие запрещено" journal_entry_allowed exec /usr/local/bin/xray ""
+assert_true "restored для manifest допустим" journal_entry_allowed restored /var/lib/mifa-vpn-basic/manifest /var/backups/mifa-vpn-basic/install-1/var/lib/mifa-vpn-basic/manifest
+assert_false "restored из чужого пути запрещён" journal_entry_allowed restored /var/lib/mifa-vpn-basic/manifest /tmp/evil
+
+t_section "txn_file_matches: файлы и символические ссылки"
+TDIR="$(mktemp -d)"
+printf 'a\n' >"${TDIR}/ref"
+cp -a "${TDIR}/ref" "${TDIR}/cur"
+assert_true "совпадающие обычные файлы" txn_file_matches "${TDIR}/ref" "${TDIR}/cur"
+printf 'b\n' >"${TDIR}/cur"
+assert_false "разное содержимое" txn_file_matches "${TDIR}/ref" "${TDIR}/cur"
+ln -s ref "${TDIR}/link1"
+ln -s ref "${TDIR}/link2"
+assert_true "совпадающие симлинки" txn_file_matches "${TDIR}/link1" "${TDIR}/link2"
+ln -sf other "${TDIR}/link2"
+assert_false "разные цели симлинков" txn_file_matches "${TDIR}/link1" "${TDIR}/link2"
+assert_false "файл против симлинка" txn_file_matches "${TDIR}/ref" "${TDIR}/link1"
+assert_false "отсутствующий файл" txn_file_matches "${TDIR}/absent" "${TDIR}/cur"
+
+t_section "journal_mark_restored: запись маркера в журнал"
+MJ="${TDIR}/journal"
+printf 'restore\t/usr/local/etc/xray/config.json\t/var/backups/mifa-vpn-basic/install-1/usr/local/etc/xray/config.json\n' >"$MJ"
+assert_true "маркер восстановления записан" journal_mark_restored "$MJ" /usr/local/etc/xray/config.json /var/backups/mifa-vpn-basic/install-1/usr/local/etc/xray/config.json
+assert_contains "маркер добавлен в журнал" "$(cat "$MJ")" "restored	/usr/local/etc/xray/config.json	/var/backups/mifa-vpn-basic/install-1/usr/local/etc/xray/config.json"
+
+t_section "txn_rollback: успешный, неудачный, повторный откат"
+RBDIR="$(mktemp -d)"
+RJ="${RBDIR}/journal.inprogress"
+rb_out="${RBDIR}/rb.out"
+# Вызов txn_rollback с недоступным systemd: daemon-reload не выполняется.
+rb_nosystemd() {
+  (
+    txn_systemd_available() { return 1; }
+    txn_rollback "$@"
+  ) >"${rb_out}" 2>&1
+}
+# Успешный откат: пустой журнал.
+: >"$RJ"
+rb_nosystemd "$RJ"; rc=$?
+assert_rc "успешный откат: код 0" 0 "$rc"
+assert_contains "успешный откат: сообщение" "$(cat "$rb_out")" "Откат завершён: изменения установщика отменены"
+assert_false "успешный откат: журнал удалён" test -e "$RJ"
+# Недопустимая запись: откат прерван до изменений, журнал сохранён, код 3.
+printf 'exec\t/etc/passwd\t\n' >"$RJ"
+TXN_ACTIVE=1
+txn_rollback "$RJ" >"${rb_out}" 2>&1; rc=$?
+assert_rc "недопустимая запись: код 3" 3 "$rc"
+assert_contains "недопустимая запись: прерывание до изменений" "$(cat "$rb_out")" "Откат прерван до изменений системы"
+assert_contains "недопустимая запись: журнал сохранён" "$(cat "$rb_out")" "$RJ"
+assert_true "недопустимая запись: журнал сохранён" test -e "$RJ"
+assert_eq "недопустимая запись: журнал не изменён" "$(printf 'exec\t/etc/passwd\t')" "$(cat "$RJ")"
+assert_eq "недопустимая запись: TXN_ACTIVE сброшен" "0" "$TXN_ACTIVE"
+# Повторный откат с той же записью: снова код 3, журнал не теряется.
+txn_rollback "$RJ" >"${rb_out}" 2>&1; rc=$?
+assert_rc "повторный откат: снова код 3" 3 "$rc"
+assert_true "повторный откат: журнал сохранён" test -e "$RJ"
+# После исправления журнала повторный откат завершается и удаляет журнал.
+printf '# исправлено вручную\n' >"$RJ"
+rb_nosystemd "$RJ"; rc=$?
+assert_rc "повторный откат после исправления: код 0" 0 "$rc"
+assert_false "журнал удалён после успешного повтора" test -e "$RJ"
+
+t_section "txn_rollback: ошибка чтения журнала"
+mkdir "${RBDIR}/dirjournal"
+txn_rollback "${RBDIR}/dirjournal" >"${rb_out}" 2>&1; rc=$?
+assert_rc "журнал-каталог: код 3" 3 "$rc"
+assert_contains "журнал-каталог: сообщение" "$(cat "$rb_out")" "Не удалось прочитать журнал"
+if [[ "$EUID" -ne 0 ]]; then
+  : >"$RJ"
+  chmod 000 "$RJ"
+  txn_rollback "$RJ" >"${rb_out}" 2>&1; rc=$?
+  assert_rc "нечитаемый журнал: код 3" 3 "$rc"
+  assert_contains "нечитаемый журнал: сообщение" "$(cat "$rb_out")" "Не удалось прочитать журнал"
+  chmod 600 "$RJ"
+else
+  echo "  SKIP  нечитаемый журнал: тест запущен от root (root читает всё)"
+fi
+
+t_section "systemctl/userdel/id: подтверждение stop/disable (моки)"
+MOCK_DIR="$(mktemp -d)"
+STUB_LOG="$(mktemp)"
+# Единственный каталог моков: systemctl, userdel и id заменены заглушками.
+# Даже при регрессии алгоритма никакая системная операция не выполнится.
+make_mocks() { # is-active, UnitFileState, LoadState, daemon-reload rc
+  cat >"${MOCK_DIR}/systemctl" <<EOS
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >>"\${STUB_LOG:-/dev/null}"
+case "\$1" in
+  is-active) echo "${1}" ;;
+  show)
+    case "\$*" in
+      *LoadState*) echo "${3}" ;;
+      *)           echo "${2}" ;;
+    esac
+    ;;
+esac
+exit "${4:-0}"
+EOS
+  cat >"${MOCK_DIR}/userdel" <<'EOS'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${STUB_LOG:-/dev/null}"
+exit 0
+EOS
+  cat >"${MOCK_DIR}/id" <<'EOS'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${STUB_LOG:-/dev/null}"
+echo 99999
+exit 0
+EOS
+  chmod 0755 "${MOCK_DIR}/systemctl" "${MOCK_DIR}/userdel" "${MOCK_DIR}/id"
+}
+run_mock() { # функция и аргументы; systemctl/userdel/id - заглушки из MOCK_DIR
+  (
+    PATH="${MOCK_DIR}:${PATH}"
+    export STUB_LOG
+    txn_systemd_available() { return 0; }
+    "$@"
+  ) 2>&1
+}
+run_mock_nosystemd() { # как run_mock, но systemd недоступен
+  (
+    PATH="${MOCK_DIR}:${PATH}"
+    export STUB_LOG
+    txn_systemd_available() { return 1; }
+    "$@"
+  ) 2>&1
+}
+# Очистка временных ресурсов по завершении теста.
+cleanup_unit_tmp() {
+  rm -rf -- "${TDIR:-}" "${RBDIR:-}" "${MOCK_DIR:-}" "${STUB_LOG:-}" 2>/dev/null || true
+}
+trap cleanup_unit_tmp EXIT
+: >"$STUB_LOG"
+make_mocks active enabled loaded
+out="$(run_mock txn_stop_unit xray.service)"; rc=$?
+assert_rc "stop: сервис активен - ошибка" 1 "$rc"
+assert_contains "stop: предупреждение" "$out" "Не удалось подтвердить остановку xray.service"
+assert_contains "stop: systemctl stop вызван" "$(cat "$STUB_LOG")" "stop xray.service"
+: >"$STUB_LOG"
+make_mocks active enabled loaded
+out="$(run_mock txn_disable_unit xray.service)"; rc=$?
+assert_rc "disable: unit включён - ошибка" 1 "$rc"
+assert_contains "disable: предупреждение" "$out" "Не удалось подтвердить отключение xray.service"
+assert_contains "disable: systemctl disable вызван" "$(cat "$STUB_LOG")" "disable xray.service"
+make_mocks unknown "" loaded
+out="$(run_mock txn_stop_unit xray.service)"; rc=$?
+assert_rc "stop: неизвестное состояние - ошибка" 1 "$rc"
+make_mocks unknown "" loaded
+out="$(run_mock txn_disable_unit xray.service)"; rc=$?
+assert_rc "disable: неизвестное состояние - ошибка" 1 "$rc"
+make_mocks unknown "" not-found
+out="$(run_mock txn_stop_unit xray.service)"; rc=$?
+assert_rc "stop: unit отсутствует - не ошибка" 0 "$rc"
+make_mocks unknown "" not-found
+out="$(run_mock txn_disable_unit xray.service)"; rc=$?
+assert_rc "disable: unit отсутствует - не ошибка" 0 "$rc"
+make_mocks inactive disabled loaded
+out="$(run_mock txn_stop_unit xray.service)"; rc=$?
+assert_rc "stop: сервис остановлен - успех" 0 "$rc"
+make_mocks inactive disabled loaded
+out="$(run_mock txn_disable_unit xray.service)"; rc=$?
+assert_rc "disable: unit отключён - успех" 0 "$rc"
+
+t_section "txn_rollback: systemd недоступен при наличии stop"
+printf 'userdel\txray\t\nstop\txray.service\t\n' >"$RJ"
+out="$(run_mock_nosystemd txn_rollback "$RJ")"; rc=$?
+assert_rc "systemd недоступен: код 3" 3 "$rc"
+assert_contains "systemd недоступен: сообщение" "$out" "systemd недоступен"
+assert_contains "systemd недоступен: файлы не тронуты" "$out" "1 действий с файлами не выполнялись"
+assert_true "systemd недоступен: журнал сохранён" test -e "$RJ"
+
+t_section "txn_rollback: фаза сервиса до файловых операций"
+printf 'userdel\txray\t\nstop\txray.service\t\n' >"$RJ"
+make_mocks active enabled loaded
+out="$(run_mock txn_rollback "$RJ")"; rc=$?
+assert_rc "stop не подтверждён: код 3" 3 "$rc"
+assert_contains "пропуск файловых действий" "$out" "1 действий с файлами не выполнялись"
+assert_true "журнал сохранён после блокировки" test -e "$RJ"
+# После подтверждения остановки откат завершается.
+printf 'stop\txray.service\t\n' >"$RJ"
+make_mocks inactive disabled loaded
+out="$(run_mock txn_rollback "$RJ")"; rc=$?
+assert_rc "после подтверждения остановки: код 0" 0 "$rc"
+assert_false "журнал удалён после подтверждения" test -e "$RJ"
+
+t_section "txn_rollback: сбой daemon-reload"
+: >"$RJ"
+make_mocks inactive disabled loaded 1
+out="$(run_mock txn_rollback "$RJ")"; rc=$?
+assert_rc "daemon-reload ошибка: код 3" 3 "$rc"
+assert_contains "daemon-reload сообщение" "$out" "daemon-reload завершился с ошибкой"
+assert_true "журнал сохранён при сбое daemon-reload" test -e "$RJ"
+
+t_section "on_exit: код возврата при откате"
+out="$(
+  (
+    trap - EXIT ERR
+    TXN_ACTIVE=1
+    txn_rollback() { return 3; }
+    false
+    on_exit
+  ) 2>&1
+)"; rc=$?
+assert_rc "on_exit: незавершённый откат - код 3" 3 "$rc"
+assert_contains "on_exit: резервные копии упомянуты" "$out" "резервные копии"
+out="$(
+  (
+    trap - EXIT ERR
+    TXN_ACTIVE=1
+    txn_rollback() { return 0; }
+    false
+    on_exit
+  ) 2>&1
+)"; rc=$?
+assert_rc "on_exit: успешный откат сохраняет исходный код" 1 "$rc"
+
+t_section "do_rollback_mode: «нет журнала» против «журнал недоступен»"
+out="$(do_rollback_mode "${RBDIR}/absent" 2>&1)"; rc=$?
+assert_rc "нет журнала: код 0" 0 "$rc"
+out="$(do_rollback_mode "${RBDIR}/dirjournal" 2>&1)"; rc=$?
+assert_rc "журнал-каталог: код 3" 3 "$rc"
+assert_contains "журнал-каталог: сообщение" "$out" "не является файлом"
+printf 'exec\t/etc/passwd\t\n' >"$RJ"
+out="$(run_mock_nosystemd do_rollback_mode "$RJ")"; rc=$?
+assert_rc "недопустимая запись через do_rollback_mode: код 3" 3 "$rc"
+assert_true "журнал сохранён после недопустимой записи" test -e "$RJ"
+printf '# исправлено вручную\n' >"$RJ"
+out="$(run_mock_nosystemd do_rollback_mode "$RJ")"; rc=$?
+assert_rc "повторный вызов после исправления: код 0" 0 "$rc"
+assert_false "журнал удалён после успешного повтора" test -e "$RJ"
 
 t_section "port_in_use"
 if command -v ss >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then

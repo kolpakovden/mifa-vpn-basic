@@ -31,6 +31,8 @@ readonly JOURNAL="${STATE_DIR}/journal.inprogress"
 readonly MANIFEST="${STATE_DIR}/manifest"
 readonly CLIENT_FILE="${STATE_DIR}/client.txt"
 readonly BACKUP_ROOT="/var/backups/mifa-vpn-basic"
+# Откат не выполнен полностью: журнал сохранён, нужна повторная попытка.
+readonly RC_ROLLBACK_INCOMPLETE=3
 
 readonly DEFAULT_PORT="8443"
 readonly FINGERPRINT="chrome"
@@ -569,7 +571,7 @@ pf_check_systemd() {
 pf_check_commands() {
   local c
   local -a missing=()
-  for c in curl openssl sha256sum base64 systemctl ss getent install mktemp timeout \
+  for c in curl openssl sha256sum base64 systemctl ss getent install mktemp timeout cmp readlink \
            awk sed grep sort cut tr id useradd userdel runuser flock df findmnt uname stat; do
     if ! command -v "$c" >/dev/null 2>&1; then
       missing+=("$c")
@@ -1241,7 +1243,7 @@ journal_entry_allowed() {
   case "$action" in
     stop|disable) [[ "$a1" == "$XRAY_SERVICE" ]] ;;
     userdel)      [[ "$a1" == "$XRAY_USER" ]] ;;
-    remove|rmdir|chmeta|restore)
+    remove|rmdir|chmeta|restore|restored)
       [[ "$a1" != *..* ]] || return 1
       case "$a1" in
         "$XRAY_BIN"|"$XRAY_BIN".mifa-new.*|"$XRAY_UNIT"|"$XRAY_UNIT".mifa-new.*) ;;
@@ -1249,7 +1251,7 @@ journal_entry_allowed() {
         /usr/local|/usr/local/bin|/usr/local/etc|/etc/systemd/system) ;;
         *) return 1 ;;
       esac
-      if [[ "$action" == "restore" ]]; then
+      if [[ "$action" == "restore" || "$action" == "restored" ]]; then
         [[ "$a2" == "$BACKUP_ROOT"/* && "$a2" != *..* ]] || return 1
       fi
       ;;
@@ -1257,32 +1259,146 @@ journal_entry_allowed() {
   esac
 }
 
+# systemd нужен откату только там, где он есть. Для записей stop/disable его
+# отсутствие считается ошибкой: файлы нельзя удалять из-под работающего сервиса.
+txn_systemd_available() {
+  command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+
+# 0, если запись уже совпадает с резервной копией. Обычные файлы сравниваются
+# по содержимому и метаданным; символические ссылки - по типу, цели (readlink,
+# без разыменования) и метаданным самой ссылки. Ничего не разыменовывается.
+txn_file_matches() {
+  local ref="$1" cur="$2" rstat cstat rlink clink
+  [[ -e "$ref" || -L "$ref" ]] || return 1
+  [[ -e "$cur" || -L "$cur" ]] || return 1
+  if [[ -L "$ref" || -L "$cur" ]]; then
+    [[ -L "$ref" && -L "$cur" ]] || return 1
+    rstat="$(stat -c '%a:%u:%g' -- "$ref" 2>/dev/null)" || return 1
+    cstat="$(stat -c '%a:%u:%g' -- "$cur" 2>/dev/null)" || return 1
+    [[ "$rstat" == "$cstat" ]] || return 1
+    rlink="$(readlink -- "$ref")" || return 1
+    clink="$(readlink -- "$cur")" || return 1
+    [[ "$rlink" == "$clink" ]]
+    return
+  fi
+  [[ -f "$ref" && -f "$cur" ]] || return 1
+  rstat="$(stat -c '%a:%u:%g:%s:%Y' -- "$ref" 2>/dev/null)" || return 1
+  cstat="$(stat -c '%a:%u:%g:%s:%Y' -- "$cur" 2>/dev/null)" || return 1
+  [[ "$rstat" == "$cstat" ]] && cmp -s -- "$ref" "$cur"
+}
+
+# Фиксирует выполненное восстановление: повторный откат проверяет файл, а не
+# перезаписывает его вслепую. Ошибки записи и синхронизации - критические:
+# без маркера повторный откат мог бы затереть изменения администратора.
+journal_mark_restored() {
+  local journal="$1" dest="$2" backup="$3"
+  if ! printf 'restored\t%s\t%s\n' "$dest" "$backup" >>"$journal"; then
+    warn "Не удалось записать отметку восстановления ${dest} в журнал ${journal}"
+    return 1
+  fi
+  if ! sync "$journal" 2>/dev/null; then
+    warn "Не удалось синхронизировать журнал ${journal}"
+    return 1
+  fi
+}
+
+# Остановка сервиса - критическое действие отката: недоступность systemd и
+# неизвестное состояние считаются ошибкой.
+txn_stop_unit() {
+  local unit="$1" state load
+  if ! txn_systemd_available; then
+    warn "Не удалось проверить остановку ${unit}: systemd недоступен"
+    return 1
+  fi
+  systemctl stop "$unit" >/dev/null 2>&1 || true
+  state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+  case "$state" in
+    inactive|failed) return 0 ;;
+  esac
+  if [[ -z "$state" || "$state" == "unknown" ]]; then
+    load="$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)"
+    [[ "$load" == "not-found" ]] && return 0
+  fi
+  warn "Не удалось подтвердить остановку ${unit}: состояние ${state:-неизвестно}"
+  return 1
+}
+
+# Отключение автозапуска - тоже критическое действие отката.
+txn_disable_unit() {
+  local unit="$1" state load
+  if ! txn_systemd_available; then
+    warn "Не удалось проверить отключение ${unit}: systemd недоступен"
+    return 1
+  fi
+  systemctl disable "$unit" >/dev/null 2>&1 || true
+  state="$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null || true)"
+  case "$state" in
+    disabled|masked|masked-runtime|static|indirect|alias|generated|transient) return 0 ;;
+  esac
+  if [[ -z "$state" || "$state" == "unknown" ]]; then
+    load="$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)"
+    [[ "$load" == "not-found" ]] && return 0
+  fi
+  warn "Не удалось подтвердить отключение ${unit}: состояние ${state:-неизвестно}"
+  return 1
+}
+
 txn_rollback() {
-  local journal="${1:-$JOURNAL}" i action a1 a2 m u g rmstate=0 rc=0
-  local -a lines=()
+  local journal="${1:-$JOURNAL}" i action a1 a2 m u g entry rmstate=0 rc=0 blocked=0 skipped=0 leftover=""
+  local -a lines=() entries=()
+  local -A restored=()
   set +e
   trap - ERR
-  if [[ ! -f "$journal" ]]; then
+  if [[ ! -e "$journal" && ! -L "$journal" ]]; then
     TXN_ACTIVE=0
     return 0
   fi
+  # Ошибка чтения журнала: ни одно действие не выполняется, журнал сохраняется.
+  if [[ ! -f "$journal" || ! -r "$journal" ]] || ! mapfile -t lines <"$journal"; then
+    TXN_ACTIVE=0
+    warn "Не удалось прочитать журнал ${journal}: ни одно действие отката не выполнено"
+    warn "Журнал и резервные копии в ${BACKUP_ROOT} сохранены; устраните причину и повторите: sudo bash install.sh --rollback"
+    return "$RC_ROLLBACK_INCOMPLETE"
+  fi
   warn "Откат изменений по журналу ${journal}"
-  mapfile -t lines <"$journal"
+  # Предварительная проверка всех записей. Любая недопустимая или повреждённая
+  # запись прерывает откат до изменений системы: журнал сохраняется.
   for ((i = ${#lines[@]} - 1; i >= 0; i--)); do
     [[ -z "${lines[i]}" || "${lines[i]}" == \#* ]] && continue
     IFS=$'\t' read -r action a1 a2 <<<"${lines[i]}"
     if ! journal_entry_allowed "$action" "$a1" "$a2"; then
-      warn "Пропущена недопустимая запись журнала: ${lines[i]}"
-      rc=1
+      TXN_ACTIVE=0
+      warn "Недопустимая запись журнала: ${lines[i]}"
+      warn "Откат прерван до изменений системы: журнал ${journal} сохранён"
+      warn "Исправьте журнал или выполните ручную очистку (docs/RECOVERY.md, раздел 6)"
+      return "$RC_ROLLBACK_INCOMPLETE"
+    fi
+    entries+=("${action}"$'\t'"${a1}"$'\t'"${a2}")
+    if [[ "$action" == "restored" ]]; then
+      restored["$a1"]="$a2"
+    fi
+  done
+  # Фаза 1: сервис. Пока остановка и отключение не подтверждены, файловые
+  # действия не выполняются - независимо от порядка записей в журнале.
+  for entry in "${entries[@]}"; do
+    IFS=$'\t' read -r action a1 a2 <<<"$entry"
+    case "$action" in
+      stop)    txn_stop_unit "$a1"    || { rc=1; blocked=1; } ;;
+      disable) txn_disable_unit "$a1" || { rc=1; blocked=1; } ;;
+    esac
+  done
+  # Фаза 2: файлы, права, пользователь и каталоги.
+  for entry in "${entries[@]}"; do
+    IFS=$'\t' read -r action a1 a2 <<<"$entry"
+    case "$action" in
+      stop|disable|restored) continue ;;
+    esac
+    if (( blocked )); then
+      skipped=$((skipped + 1))
       continue
     fi
     case "$action" in
-      stop)
-        systemctl stop "$a1" >/dev/null 2>&1
-        ;;
-      disable)
-        systemctl disable "$a1" >/dev/null 2>&1
-        ;;
       remove)
         if [[ -e "$a1" || -L "$a1" ]]; then
           rm -f -- "$a1" || { warn "Не удалось удалить ${a1}"; rc=1; }
@@ -1303,9 +1419,23 @@ txn_rollback() {
         fi
         ;;
       restore)
-        if cp -a -- "$a2" "${a1}.mifa-restore" && mv -f -- "${a1}.mifa-restore" "$a1"; then
+        if [[ -n "${restored[$a1]:-}" ]]; then
+          if txn_file_matches "$a2" "$a1"; then
+            info "Уже восстановлен ${a1}: содержимое и метаданные совпадают с ${a2}"
+          else
+            warn "Файл ${a1} изменён после восстановления: не перезаписывается, решение за администратором"
+            rc=1
+          fi
+        elif txn_file_matches "$a2" "$a1"; then
+          info "Уже восстановлен ${a1}: содержимое и метаданные совпадают с ${a2}"
+          journal_mark_restored "$journal" "$a1" "$a2" \
+            || { warn "Не удалось отметить восстановление ${a1} в журнале"; rc=1; }
+        elif cp -a -- "$a2" "${a1}.mifa-restore" && mv -f -- "${a1}.mifa-restore" "$a1"; then
           info "Восстановлен ${a1} из ${a2}"
+          journal_mark_restored "$journal" "$a1" "$a2" \
+            || { warn "Не удалось отметить восстановление ${a1} в журнале"; rc=1; }
         else
+          rm -f -- "${a1}.mifa-restore"
           warn "Не удалось восстановить ${a1} из ${a2}"
           rc=1
         fi
@@ -1317,21 +1447,43 @@ txn_rollback() {
         ;;
     esac
   done
-  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-    systemctl daemon-reload >/dev/null 2>&1
-    systemctl reset-failed "$XRAY_SERVICE" >/dev/null 2>&1
+  if (( blocked )); then
+    warn "Откат прерван: ${XRAY_SERVICE} не подтверждён остановленным и отключённым, ${skipped} действий с файлами не выполнялись"
   fi
-  rm -f -- "$journal"
-  if (( rmstate )); then
-    rmdir -- "$STATE_DIR" 2>/dev/null
+  # daemon-reload обязателен после изменения unit-файлов.
+  if txn_systemd_available; then
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+      warn "systemctl daemon-reload завершился с ошибкой: изменения unit-файлов не применены"
+      rc=1
+    fi
+    systemctl reset-failed "$XRAY_SERVICE" >/dev/null 2>&1 || true
   fi
   TXN_ACTIVE=0
-  if (( rc == 0 )); then
-    ok "Откат завершён: изменения установщика отменены"
-  else
-    warn "Откат завершён с предупреждениями: проверьте сообщения выше и docs/RECOVERY.md"
+  # Каталог состояния после отката должен содержать только журнал.
+  if (( rc == 0 && rmstate )) && [[ "$journal" == "$STATE_DIR"/* ]]; then
+    if ! leftover="$(find "$STATE_DIR" -mindepth 1 -maxdepth 1 ! -path "$journal" -print -quit 2>/dev/null)"; then
+      warn "Не удалось проверить содержимое ${STATE_DIR}"
+      rc=1
+    elif [[ -n "$leftover" ]]; then
+      warn "В ${STATE_DIR} остались посторонние файлы (${leftover}): откат не завершён"
+      rc=1
+    fi
   fi
-  return "$rc"
+  if (( rc != 0 )); then
+    warn "Откат завершён не полностью: журнал ${journal} и резервные копии в ${BACKUP_ROOT} сохранены"
+    warn "Устраните причину и повторите: sudo bash install.sh --rollback; ручная очистка - docs/RECOVERY.md, раздел 6"
+    return "$RC_ROLLBACK_INCOMPLETE"
+  fi
+  # Журнал удаляется последним; после этого обязательных операций нет.
+  if ! rm -f -- "$journal"; then
+    warn "Не удалось удалить журнал ${journal}: откат можно повторить"
+    return "$RC_ROLLBACK_INCOMPLETE"
+  fi
+  if (( rmstate )) && ! rmdir -- "$STATE_DIR" 2>/dev/null; then
+    warn "Каталог ${STATE_DIR} не пуст: удалите его вручную (docs/RECOVERY.md, раздел 6)"
+  fi
+  ok "Откат завершён: изменения установщика отменены"
+  return 0
 }
 
 txn_commit() {
@@ -1347,7 +1499,11 @@ on_exit() {
   set +e
   if [[ "$TXN_ACTIVE" == "1" ]]; then
     err "Установка не завершена (код ${rc}). Выполняется автоматический откат."
-    txn_rollback
+    if ! txn_rollback "$JOURNAL"; then
+      err "Автоматический откат не завершён: журнал ${JOURNAL} и резервные копии в ${BACKUP_ROOT} сохранены"
+      err "Устраните причину и повторите: sudo bash install.sh --rollback; ручная очистка - docs/RECOVERY.md, раздел 6"
+      rc="$RC_ROLLBACK_INCOMPLETE"
+    fi
   fi
   if [[ -n "$WORKDIR" && -d "$WORKDIR" ]]; then
     rm -rf -- "$WORKDIR"
@@ -1563,11 +1719,23 @@ print_result() {
 }
 
 do_rollback_mode() {
-  if [[ ! -f "$JOURNAL" ]]; then
+  local journal="${1:-$JOURNAL}"
+  if [[ ! -e "$journal" && ! -L "$journal" ]]; then
     ok "Журнал незавершённой установки не найден: откатывать нечего"
     return 0
   fi
-  txn_rollback "$JOURNAL"
+  # Существует, но не является обычным читаемым файлом: это ошибка, а не
+  # «журнала нет». Возвращаем код 3, журнал не удаляем.
+  if [[ ! -f "$journal" || ! -r "$journal" ]]; then
+    err "Журнал ${journal} недоступен или не является файлом: откат не выполнен"
+    return "$RC_ROLLBACK_INCOMPLETE"
+  fi
+  if ! txn_rollback "$journal"; then
+    err "Откат не завершён: журнал ${journal} и резервные копии в ${BACKUP_ROOT} сохранены"
+    err "Устраните причину и повторите: sudo bash install.sh --rollback; ручная очистка - docs/RECOVERY.md, раздел 6"
+    return "$RC_ROLLBACK_INCOMPLETE"
+  fi
+  return 0
 }
 
 main() {
@@ -1578,7 +1746,9 @@ main() {
     rollback)
       require_root
       acquire_lock
-      do_rollback_mode
+      if ! do_rollback_mode; then
+        exit "$RC_ROLLBACK_INCOMPLETE"
+      fi
       ;;
     preflight)
       run_preflight

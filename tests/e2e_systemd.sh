@@ -342,6 +342,57 @@ assert_eq "клиент подключается после восстановл
 bash "$UNINSTALL_SH" --yes >/dev/null 2>&1
 assert_clean_host "после удаления"
 
+t_section "Незавершённый откат: код 3, журнал и резервные копии сохранены"
+out="$(MIFA_BASIC_TEST_MODE=1 MIFA_BASIC_TEST_FAIL_AT=after_enable:kill bash "$INSTALL_SH" "${BASE[@]}" "${SRC[@]}" 2>&1)"; rc=$?
+assert_rc "установка убита SIGKILL" 137 "$rc"
+assert_true "журнал создан" test -f /var/lib/mifa-vpn-basic/journal.inprogress
+assert_true "каталог конфига создан" test -d /usr/local/etc/xray
+printf 'keep\n' >/usr/local/etc/xray/keep-me.txt
+out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
+assert_rc "--rollback при неполном откате: код 3" 3 "$rc"
+assert_contains "журнал сохранён" "$out" "журнал /var/lib/mifa-vpn-basic/journal.inprogress и резервные копии"
+assert_contains "каталог не пуст" "$out" "не пуст"
+assert_true "журнал сохранён" test -f /var/lib/mifa-vpn-basic/journal.inprogress
+assert_true "посторонний файл не удалён" test -e /usr/local/etc/xray/keep-me.txt
+assert_false "сервис не активен" systemctl is-active --quiet xray.service
+assert_false "бинарник удалён" test -e /usr/local/bin/xray
+out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
+assert_rc "повторный --rollback без исправления: снова код 3" 3 "$rc"
+assert_true "журнал по-прежнему сохранён" test -f /var/lib/mifa-vpn-basic/journal.inprogress
+rm -f /usr/local/etc/xray/keep-me.txt
+out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
+assert_rc "повторный --rollback после исправления: код 0" 0 "$rc"
+assert_false "журнал удалён" test -e /var/lib/mifa-vpn-basic/journal.inprogress
+assert_clean_host "после повторного --rollback"
+
+t_section "Частичный restore: маркер, повтор и сохранение данных"
+install -d -m 700 /var/lib/mifa-vpn-basic
+printf 'mifa_basic_version=stale\n' >/var/lib/mifa-vpn-basic/manifest
+chmod 600 /var/lib/mifa-vpn-basic/manifest
+stale_sha_retry="$(sha256sum /var/lib/mifa-vpn-basic/manifest | awk '{print $1}')"
+out="$(MIFA_BASIC_TEST_MODE=1 MIFA_BASIC_TEST_FAIL_AT=before_commit:kill bash "$INSTALL_SH" "${BASE[@]}" "${SRC[@]}" 2>&1)"; rc=$?
+assert_rc "поздний сбой (kill после старта): код 137" 137 "$rc"
+assert_true "журнал остался" test -f /var/lib/mifa-vpn-basic/journal.inprogress
+printf 'keep\n' >/usr/local/etc/xray/keep-me.txt
+out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
+assert_rc "первый откат с restore и rmdir-ошибкой: код 3" 3 "$rc"
+assert_contains "restore выполнен" "$out" "Восстановлен /var/lib/mifa-vpn-basic/manifest"
+assert_contains "журнал сохранён" "$out" "журнал /var/lib/mifa-vpn-basic/journal.inprogress и резервные копии"
+assert_true "журнал содержит маркер restored" grep -q $'restored\t/var/lib/mifa-vpn-basic/manifest\t' /var/lib/mifa-vpn-basic/journal.inprogress
+assert_eq "манифест восстановлен" "$stale_sha_retry" "$(sha256sum /var/lib/mifa-vpn-basic/manifest | awk '{print $1}')"
+assert_false "client.txt удалён" test -e /var/lib/mifa-vpn-basic/client.txt
+out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
+assert_rc "повторный откат с маркером restore: код 3" 3 "$rc"
+assert_contains "restore не повторяется" "$out" "Уже восстановлен /var/lib/mifa-vpn-basic/manifest"
+assert_eq "манифест не перезаписан повторно" "$stale_sha_retry" "$(sha256sum /var/lib/mifa-vpn-basic/manifest | awk '{print $1}')"
+assert_true "журнал по-прежнему сохранён" test -f /var/lib/mifa-vpn-basic/journal.inprogress
+rm -f /usr/local/etc/xray/keep-me.txt
+out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
+assert_rc "повторный откат после устранения причины: код 0" 0 "$rc"
+assert_eq "манифест восстановлен байт в байт" "$stale_sha_retry" "$(sha256sum /var/lib/mifa-vpn-basic/manifest | awk '{print $1}')"
+rm -rf /var/lib/mifa-vpn-basic /var/backups/mifa-vpn-basic
+assert_clean_host "после очистки (частичный restore)"
+
 if [[ "${MIFA_E2E_SKIP_APT:-0}" != "1" ]]; then
   t_section "Нет unzip и python3: установщик ставит unzip через apt"
   if command -v unzip >/dev/null 2>&1; then

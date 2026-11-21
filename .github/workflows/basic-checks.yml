@@ -5,6 +5,17 @@ on:
     branches: [main, "hardening/**"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_privileged_e2e:
+        description: Explicitly run privileged systemd E2E on disposable GitHub-hosted VMs
+        type: boolean
+        required: true
+        default: false
+      disposable_linux_vm:
+        description: Confirm the disposable Linux VM; privileged Docker is NOT host isolation
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
@@ -71,9 +82,13 @@ jobs:
 
   e2e:
     name: E2E в контейнере с systemd (Ubuntu ${{ matrix.ubuntu }})
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.run_privileged_e2e == true && inputs.disposable_linux_vm == true
     needs: [lint, xray-pin]
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Leave time after the runner's bounded build/test for cleanup and artifacts.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -83,7 +98,12 @@ jobs:
       # REALITY с настоящим сайтом и выход в интернет через туннель.
       MIFA_E2E_PUBLIC_SNI: www.microsoft.com
     steps:
+      - name: Require a disposable GitHub-hosted Linux runner
+        run: |
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted && "$RUNNER_OS" == Linux ]]
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: xray-release
@@ -91,4 +111,22 @@ jobs:
       - name: cgroup на раннере
         run: stat -fc %T /sys/fs/cgroup
       - name: e2e
-        run: MIFA_TEST_XRAY_ZIP_HOST="$RUNNER_TEMP/xray/Xray-linux-64.zip" bash tests/run-docker.sh e2e "${{ matrix.ubuntu }}"
+        env:
+          MIFA_TEST_XRAY_ZIP_HOST: ${{ runner.temp }}/xray/Xray-linux-64.zip
+        # The hosted VM is disposable; privileged Docker itself is NOT isolation.
+        run: bash tests/run-ci-docker.sh e2e "${{ matrix.ubuntu }}" "$RUNNER_TEMP/e2e-results" --disposable-linux-vm
+      - name: E2E summary
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/e2e-results/summary.md" ]]; then
+            cat "$RUNNER_TEMP/e2e-results/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'E2E did not produce a result; inspect setup/cancellation errors.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-ubuntu-${{ matrix.ubuntu }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-results/
+          retention-days: 7
+          if-no-files-found: error

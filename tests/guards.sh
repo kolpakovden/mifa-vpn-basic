@@ -113,16 +113,27 @@ assert_contains "uninstall.sh: подсказка --rollback" "$out" "--rollback
 t_section "--rollback не выполняет недопустимые записи журнала"
 passwd_before="$(sha256sum /etc/passwd)"
 printf '#!/bin/sh\n' >/usr/local/bin/xray
+jf=/var/lib/mifa-vpn-basic/journal.inprogress
 printf 'remove\t/etc/passwd\t\nuserdel\troot\t\nremove\t/usr/local/etc/xray/../../../etc/shadow\t\nrestore\t/usr/local/etc/xray/config.json\t/tmp/evil\nremove\t/usr/local/bin/xray\t\nrmdir\t/var/lib/mifa-vpn-basic\t\n' \
-  >/var/lib/mifa-vpn-basic/journal.inprogress
+  >"$jf"
 out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
-assert_rc_nonzero "откат сообщает о пропущенных записях" "$rc"
-assert_contains "предупреждение о недопустимой записи" "$out" "Пропущена недопустимая запись"
+assert_rc "недопустимая запись: код 3" 3 "$rc"
+assert_contains "предупреждение о недопустимой записи" "$out" "Недопустимая запись журнала"
+assert_contains "журнал сохранён" "$out" "журнал ${jf} сохранён"
 assert_eq "/etc/passwd не тронут" "$passwd_before" "$(sha256sum /etc/passwd)"
 assert_true "/etc/shadow на месте" test -e /etc/shadow
 assert_true "root на месте" user_exists root
-assert_false "допустимая запись выполнена" test -e /usr/local/bin/xray
-assert_false "журнал удалён" test -e /var/lib/mifa-vpn-basic/journal.inprogress
+assert_true "бинарник не тронут (откат прерван до изменений)" test -e /usr/local/bin/xray
+assert_true "журнал сохранён" test -e "$jf"
+assert_true "каталог состояния сохранён вместе с журналом" test -d /var/lib/mifa-vpn-basic
+out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
+assert_rc "повторный --rollback с тем же журналом: снова код 3" 3 "$rc"
+assert_true "журнал сохранён после повтора" test -e "$jf"
+# После исправления журнала откат завершается и удаляет служебный каталог.
+printf 'remove\t/usr/local/bin/xray\t\nrmdir\t/var/lib/mifa-vpn-basic\t\n' >"$jf"
+out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
+assert_rc "повторный --rollback после исправления: код 0" 0 "$rc"
+assert_false "журнал удалён" test -e "$jf"
 assert_clean "после --rollback"
 out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
 assert_rc "повторный --rollback: нечего откатывать" 0 "$rc"
