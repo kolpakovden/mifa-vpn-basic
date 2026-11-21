@@ -62,6 +62,9 @@ jobs:
           persist-credentials: false
       - name: Validate event and select scenarios without running installer/tests
         id: catalog
+        env:
+          # Targeted P1-4 run; same branch/path/HEAD-marker opt-in as bootstrap.
+          MIFA_BASELINE_PUSH_PROFILE: p14
         run: |
           scenarios="$(bash tests/rollback_regressions.sh --list)"
           printf '%s\n' "$scenarios" | python3 tests/baseline_plan.py >> "$GITHUB_OUTPUT"

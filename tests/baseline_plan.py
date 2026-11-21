@@ -10,6 +10,9 @@ BRANCH = "refs/heads/experiment/deepseek-rollback"
 SMOKE = ["control-remove", "control-restore", "repeat-remove", "parent-chmeta",
          "staging-symlink", "enable-without-stop"]
 VERSIONS = ["22.04", "24.04", "26.04"]
+P14_CONTROLS = ["control-remove", "control-restore", "staging-file", "staging-symlink",
+                "staging-directory", "destination-directory"]
+P14_NEGATIVE = ["repeat-remove", "parent-chmeta", "enable-without-stop"]
 
 
 def boolean(value):
@@ -20,10 +23,10 @@ def boolean(value):
     raise ValueError("Expected an explicit boolean")
 
 
-def select(event_name, ref, event, catalog):
+def select(event_name, ref, event, catalog, push_profile="smoke"):
     if not catalog or len(catalog) != len(set(catalog)):
         raise ValueError("Empty or duplicate regression catalog")
-    if not all(re.fullmatch(r"[a-z][a-z-]*", name) for name in catalog):
+    if not all(re.fullmatch(r"[a-z][a-z0-9-]*", name) for name in catalog):
         raise ValueError("Invalid regression catalog")
     if event_name == "push":
         message = (event.get("head_commit") or {}).get("message", "")
@@ -32,6 +35,13 @@ def select(event_name, ref, event, catalog):
         # Bootstrap AND dispatch-unavailable fallback: fixed, unprivileged only.
         # Do not use dispatch inputs or commit text as matrix values on push.
         versions, cases, systemd, profile = ["24.04"], SMOKE[:], False, "push-smoke"
+        if push_profile == "p14":
+            restores = [name for name in catalog if name.startswith("restore-")]
+            if not restores:
+                raise ValueError("P1-4 restore regression catalog is empty")
+            cases, profile = P14_CONTROLS + restores + P14_NEGATIVE, "push-p14"
+        elif push_profile != "smoke":
+            raise ValueError("Unknown push baseline profile")
     elif event_name == "workflow_dispatch":
         inputs = event.get("inputs") or {}
         version = inputs.get("ubuntu", "")
@@ -61,7 +71,8 @@ def main():
     try:
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
         plan = select(os.environ["GITHUB_EVENT_NAME"], os.environ["GITHUB_REF"],
-                      event, sys.stdin.read().splitlines())
+                      event, sys.stdin.read().splitlines(),
+                      os.environ.get("MIFA_BASELINE_PUSH_PROFILE", "smoke"))
     except (ValueError, KeyError, OSError) as error:
         print(f"Baseline selection refused: {error}", file=sys.stderr)
         return 2

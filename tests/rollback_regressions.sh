@@ -15,7 +15,15 @@ CASES=(control-remove control-restore repeat-remove repeat-rmdir repeat-chmeta
        repeat-userdel parent-remove parent-rmdir parent-chmeta leaf-chmeta
        setup-symlink-chmeta parent-restore backup-parent-restore
        staging-file staging-symlink staging-directory destination-directory
-       enable-without-stop)
+       enable-without-stop
+       restore-intent-interrupted restore-before-replace-interrupted
+       restore-after-replace-interrupted restore-after-replace-edited
+       restore-after-replace-metadata restore-after-replace-xattr
+       restore-intent-write-failure restore-intent-sync-failure
+       restore-complete-write-failure restore-complete-sync-failure
+       restore-copy-failure restore-replace-failure restore-false-replace-success
+       restore-destination-symlink restore-backup-symlink restore-backup-directory
+       restore-v1-unmarked restore-v1-matching-unmarked restore-v1-completed)
 
 # Listing does not source install.sh or perform any filesystem/account mutation.
 if [[ "${1:-}" == --list ]]; then
@@ -111,9 +119,58 @@ prepare_restore() {
   chmod 0600 "$MANIFEST"
   save_snapshot "$MANIFEST" "$W/original-manifest.json"
   txn_begin
+  must grep -Fxq "$JOURNAL_V2_HEADER" "$JOURNAL"
   txn_install_file "$W/source" "$MANIFEST" 0600 root root
   save_snapshot "$MANIFEST" "$W/destination-before.json"
   save_snapshot "$BACKUP_DIR" "$W/backup-before.json"
+}
+
+faulted_rollback() {
+  # BASH_ENV fault wrappers affect only the isolated rollback process. They
+  # inject actual append/flush/copy/rename failures, not successful assertions.
+  cat >"$W/restore-faults" <<'FAULTS'
+printf() {
+  if [[ "${1:-}" == '%s\t%s\t%s\n' ]]; then
+    case "${MIFA_RB_RESTORE_FAIL:-}:${2:-}" in
+      intent-write:restoring|complete-write:restored)
+        builtin printf 'MIFA_RB_INJECTED\t%s\n' "$MIFA_RB_RESTORE_FAIL" >&2
+        return 1 ;;
+    esac
+  fi
+  builtin printf "$@"
+}
+sync() {
+  if [[ "${1:-}" == /var/lib/mifa-vpn-basic/journal.inprogress ]]; then
+    case "${MIFA_RB_RESTORE_FAIL:-}:$(tail -n 1 "$1")" in
+      intent-sync:restoring$'\t'*|complete-sync:restored$'\t'*)
+        # sync stderr is intentionally suppressed by production; stdout remains
+        # in rollback.out and proves this exact injection was exercised.
+        builtin printf 'MIFA_RB_INJECTED\t%s\n' "$MIFA_RB_RESTORE_FAIL"
+        return 1 ;;
+    esac
+  fi
+  command sync "$@"
+}
+cp() {
+  if [[ "${MIFA_RB_RESTORE_FAIL:-}" == copy && "${*: -1}" == */payload ]]; then
+    builtin printf 'MIFA_RB_INJECTED\tcopy\n' >&2
+    return 1
+  fi
+  command cp "$@"
+}
+mv() {
+  if [[ "${1:-}" == -fT && "${3:-}" == */payload ]]; then
+    case "${MIFA_RB_RESTORE_FAIL:-}" in
+      replace|false-success)
+        builtin printf 'MIFA_RB_INJECTED\t%s\n' "$MIFA_RB_RESTORE_FAIL" >&2
+        [[ "$MIFA_RB_RESTORE_FAIL" == false-success ]]
+        return $? ;;
+    esac
+  fi
+  command mv "$@"
+}
+FAULTS
+  BASH_ENV="$W/restore-faults" observed_rollback
 }
 
 t_section "$CASE"
@@ -300,6 +357,138 @@ case "$CASE" in
     assert_snapshot 'no staging residue' "$W/staging-before.json" "${MANIFEST}.mifa-restore"
     if grep -q $'restored\t/var/lib/mifa-vpn-basic/manifest\t' "$JOURNAL"; then marker_rc=0; else marker_rc=$?; fi
     assert_rc 'no false marker; journal must be readable' 1 "$marker_rc"
+    ;;
+  restore-*)
+    prepare_restore
+    case "$CASE" in
+      restore-destination-symlink|restore-backup-symlink|restore-backup-directory)
+        printf 'foreign restore data\n' >"$W/foreign"
+        save_snapshot "$W/foreign" "$W/foreign-before.json"
+        if [[ "$CASE" == restore-destination-symlink ]]; then
+          mv -T -- "$MANIFEST" "$W/installed-manifest"
+          ln -s -- "$W/foreign" "$MANIFEST"
+        else
+          mv -T -- "$BACKUP_PATH" "$W/real-backup"
+          save_snapshot "$W/real-backup" "$W/real-backup.json"
+          if [[ "$CASE" == restore-backup-symlink ]]; then
+            ln -s -- "$W/foreign" "$BACKUP_PATH"
+          else
+            mkdir -- "$BACKUP_PATH"
+            printf 'foreign directory entry\n' >"$BACKUP_PATH/keep"
+          fi
+        fi
+        save_snapshot "$MANIFEST" "$W/type-destination.json"
+        save_snapshot "$BACKUP_DIR" "$W/backup-before.json"
+        rollback
+        incomplete
+        assert_snapshot 'unsafe destination type preserved' "$W/type-destination.json" "$MANIFEST"
+        assert_snapshot 'foreign target preserved' "$W/foreign-before.json" "$W/foreign"
+        assert_false 'no restored marker for unsafe type' grep -q $'^restored\t' "$JOURNAL"
+        if [[ "$CASE" != restore-destination-symlink ]]; then
+          assert_snapshot 'original backup preserved' "$W/real-backup.json" "$W/real-backup"
+        fi
+        ;;
+      restore-v1-*)
+        # Deliberately remove the exact version header to create a real v1.
+        tail -n +2 "$JOURNAL" >"$W/v1-journal"
+        cat "$W/v1-journal" >"$JOURNAL"
+        if [[ "$CASE" == restore-v1-matching-unmarked || "$CASE" == restore-v1-completed ]]; then
+          cp -a -- "$BACKUP_PATH" "$MANIFEST"
+        fi
+        if [[ "$CASE" == restore-v1-completed ]]; then
+          printf 'restored\t%s\t%s\n' "$MANIFEST" "$BACKUP_PATH" >>"$JOURNAL"
+        fi
+        save_snapshot "$MANIFEST" "$W/v1-destination.json"
+        rollback
+        if [[ "$CASE" == restore-v1-completed ]]; then
+          assert_rc 'v1 completed restore can be verified' 0 "$RB_RC"
+          assert_true 'v1 completed journal removed' path_absent "$JOURNAL"
+        else
+          incomplete
+        fi
+        assert_snapshot 'v1 destination never replaced' "$W/v1-destination.json" "$MANIFEST"
+        ;;
+      restore-*-interrupted|restore-after-replace-edited|restore-after-replace-metadata|restore-after-replace-xattr)
+        case "$CASE" in
+          restore-intent-interrupted) fault=restore_after_intent ;;
+          restore-before-replace-interrupted) fault=restore_before_replace ;;
+          *) fault=restore_after_replace ;;
+        esac
+        MIFA_BASIC_TEST_MODE=1 MIFA_BASIC_TEST_FAIL_AT="$fault:kill" observed_rollback
+        must grep -Fq "Тестовый SIGKILL на шаге $fault" "$W/rollback.out"
+        assert_rc 'restore CLI interrupted by SIGKILL' 137 "$RB_RC"
+        assert_journal_retained
+        if [[ "$fault" != restore_after_intent ]]; then
+          stage_dirs="$(find "$STATE_DIR" -maxdepth 1 -type d -name '.mifa-restore.*' -print)"
+          must test -n "$stage_dirs"
+          # A fresh container and exactly one restore attempt: require one stage.
+          must test "$(printf '%s\n' "$stage_dirs" | wc -l)" = 1
+          save_snapshot "$stage_dirs" "$W/interrupted-stage.json"
+        fi
+        assert_true 'durable restoring record present' grep -q $'^restoring\t' "$JOURNAL"
+        assert_false 'no premature restored marker' grep -q $'^restored\t' "$JOURNAL"
+        if [[ "$fault" == restore_after_replace ]]; then
+          assert_snapshot 'replacement completed before interruption' "$W/original-manifest.json" "$MANIFEST"
+        else
+          assert_snapshot 'destination unchanged before replacement' "$W/destination-before.json" "$MANIFEST"
+        fi
+        if [[ "$CASE" == restore-after-replace-edited ]]; then
+          printf 'administrator replacement\n' >"$MANIFEST"
+          chmod 0644 "$MANIFEST"
+        elif [[ "$CASE" == restore-after-replace-metadata ]]; then
+          chmod 0644 "$MANIFEST"
+        elif [[ "$CASE" == restore-after-replace-xattr ]]; then
+          python3 - "$MANIFEST" <<'PY'
+import os, sys
+os.setxattr(sys.argv[1], "user.mifa-regression", b"administrator")
+PY
+        fi
+        save_snapshot "$MANIFEST" "$W/retry-destination.json"
+        rollback
+        if [[ "$CASE" == restore-after-replace-interrupted ]]; then
+          assert_rc 'verify-only retry confirms matching restored image' 0 "$RB_RC"
+          assert_true 'completed journal removed' path_absent "$JOURNAL"
+        else
+          incomplete
+        fi
+        assert_snapshot 'retry never overwrites destination' "$W/retry-destination.json" "$MANIFEST"
+        if [[ "$fault" != restore_after_intent ]]; then
+          assert_snapshot 'interrupted staging retained on retry' "$W/interrupted-stage.json" "$stage_dirs"
+        fi
+        ;;
+      *)
+        case "$CASE" in
+          restore-intent-write-failure) mode=intent-write ;;
+          restore-intent-sync-failure) mode=intent-sync ;;
+          restore-complete-write-failure) mode=complete-write ;;
+          restore-complete-sync-failure) mode=complete-sync ;;
+          restore-copy-failure) mode=copy ;;
+          restore-replace-failure) mode=replace ;;
+          restore-false-replace-success) mode=false-success ;;
+          *) echo 'Missing restore failure fixture' >&2; exit 2 ;;
+        esac
+        MIFA_RB_RESTORE_FAIL="$mode" faulted_rollback
+        must grep -Fxq "$(printf 'MIFA_RB_INJECTED\t%s' "$mode")" "$W/rollback.out"
+        incomplete
+        if [[ "$mode" == complete-* ]]; then
+          assert_snapshot 'full restored image retained after marker failure' "$W/original-manifest.json" "$MANIFEST"
+        else
+          assert_snapshot 'failed intent/copy/rename cannot replace destination' "$W/destination-before.json" "$MANIFEST"
+        fi
+        if [[ "$mode" != complete-sync ]]; then
+          assert_false 'no false restored marker' grep -q $'^restored\t' "$JOURNAL"
+        fi
+        save_snapshot "$MANIFEST" "$W/retry-destination.json"
+        rollback
+        if [[ "$mode" == complete-* || "$mode" == intent-write ]]; then
+          assert_rc 'retry completes only with safe evidence' 0 "$RB_RC"
+        else
+          incomplete
+          assert_snapshot 'ambiguous retry preserves destination' "$W/retry-destination.json" "$MANIFEST"
+        fi
+        ;;
+    esac
+    assert_snapshot 'backup retained across all attempts' "$W/backup-before.json" "$BACKUP_DIR"
     ;;
   enable-without-stop)
     install -d -m 0700 "$XRAY_CONF_DIR"

@@ -33,6 +33,7 @@ readonly CLIENT_FILE="${STATE_DIR}/client.txt"
 readonly BACKUP_ROOT="/var/backups/mifa-vpn-basic"
 # Откат не выполнен полностью: журнал сохранён, нужна повторная попытка.
 readonly RC_ROLLBACK_INCOMPLETE=3
+readonly JOURNAL_V2_HEADER='# MIFA VPN Basic journal v2'
 
 readonly DEFAULT_PORT="8443"
 readonly FINGERPRINT="chrome"
@@ -1144,8 +1145,16 @@ redact_config() {
 
 # --- Транзакция и откат -----------------------------------------------------
 journal_undo() {
-  printf '%s\t%s\t%s\n' "$1" "${2:-}" "${3:-}" >>"$JOURNAL"
-  sync "$JOURNAL" 2>/dev/null || true
+  journal_append "$JOURNAL" "$1" "${2:-}" "${3:-}"
+}
+
+journal_append() {
+  local journal="$1" action="$2" dest="$3" arg="$4"
+  [[ -f "$journal" && ! -L "$journal" ]] || return 1
+  printf '%s\t%s\t%s\n' "$action" "$dest" "$arg" >>"$journal" || return 1
+  # A failed flush is a failed write for the protocol. Never authorize a
+  # destination replacement merely because the line is visible in page cache.
+  sync "$journal" 2>/dev/null || return 1
 }
 
 test_fault() {
@@ -1153,7 +1162,9 @@ test_fault() {
   [[ "${MIFA_BASIC_TEST_MODE:-0}" == "1" ]] || return 0
   case "${MIFA_BASIC_TEST_FAIL_AT:-}" in
     "$1")      err "Тестовый сбой на шаге $1"; exit 97 ;;
-    "$1:kill") kill -KILL "$$" ;;
+    # Restore runs in a subshell with a pinned cwd. Kill both it and the CLI,
+    # otherwise the child could continue mutating files after its parent dies.
+    "$1:kill") err "Тестовый SIGKILL на шаге $1"; kill -KILL "$$" "$BASHPID" ;;
   esac
   return 0
 }
@@ -1166,9 +1177,10 @@ txn_begin() {
   install -d -m 0700 -o root -g root "$STATE_DIR"
   : >"$JOURNAL"
   chmod 0600 "$JOURNAL"
-  printf '# MIFA VPN Basic %s: журнал установки, начат %s\n' "$MIFA_BASIC_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$JOURNAL"
+  printf '%s\n' "$JOURNAL_V2_HEADER" >>"$JOURNAL" || return 1
+  sync "$JOURNAL" "$STATE_DIR" 2>/dev/null || return 1
   if (( created )); then
-    journal_undo rmdir "$STATE_DIR"
+    journal_undo rmdir "$STATE_DIR" || return 1
   fi
   BACKUP_DIR="${BACKUP_ROOT}/install-$(date -u +%Y%m%dT%H%M%SZ)"
   TXN_ACTIVE=1
@@ -1191,11 +1203,11 @@ txn_mkdir() {
     txn_mkdir "$parent" 0755 root root
   fi
   if [[ -d "$dir" ]]; then
-    journal_undo chmeta "$dir" "$(stat -c '%a:%u:%g' "$dir")"
+    journal_undo chmeta "$dir" "$(stat -c '%a:%u:%g' "$dir")" || return 1
   elif [[ -e "$dir" || -L "$dir" ]]; then
     die "${dir} существует и не является каталогом"
   else
-    journal_undo rmdir "$dir"
+    journal_undo rmdir "$dir" || return 1
   fi
   install -d -m "$mode" -o "$owner" -g "$group" "$dir"
 }
@@ -1207,12 +1219,12 @@ txn_install_file() {
   fi
   if [[ -e "$dest" || -L "$dest" ]]; then
     backup_path "$dest"
-    journal_undo restore "$dest" "$BACKUP_PATH"
+    journal_undo restore "$dest" "$BACKUP_PATH" || return 1
   else
-    journal_undo remove "$dest"
+    journal_undo remove "$dest" || return 1
   fi
   tmp="${dest}.mifa-new.$$"
-  journal_undo remove "$tmp"
+  journal_undo remove "$tmp" || return 1
   install -m "$mode" -o "$owner" -g "$group" -- "$src" "$tmp"
   mv -f -- "$tmp" "$dest"
 }
@@ -1226,7 +1238,7 @@ txn_create_user() {
     USER_CREATED=0
     return 0
   fi
-  journal_undo userdel "$XRAY_USER"
+  journal_undo userdel "$XRAY_USER" || return 1
   if getent group "$XRAY_USER" >/dev/null 2>&1; then
     useradd --system --gid "$XRAY_USER" --no-create-home --home-dir /nonexistent \
             --shell /usr/sbin/nologin --comment "Xray (MIFA VPN Basic)" "$XRAY_USER"
@@ -1243,7 +1255,7 @@ journal_entry_allowed() {
   case "$action" in
     stop|disable) [[ "$a1" == "$XRAY_SERVICE" ]] ;;
     userdel)      [[ "$a1" == "$XRAY_USER" ]] ;;
-    remove|rmdir|chmeta|restore|restored)
+    remove|rmdir|chmeta|restore|restoring|restored)
       [[ "$a1" != *..* ]] || return 1
       case "$a1" in
         "$XRAY_BIN"|"$XRAY_BIN".mifa-new.*|"$XRAY_UNIT"|"$XRAY_UNIT".mifa-new.*) ;;
@@ -1251,7 +1263,7 @@ journal_entry_allowed() {
         /usr/local|/usr/local/bin|/usr/local/etc|/etc/systemd/system) ;;
         *) return 1 ;;
       esac
-      if [[ "$action" == "restore" || "$action" == "restored" ]]; then
+      if [[ "$action" == restore || "$action" == restoring || "$action" == restored ]]; then
         [[ "$a2" == "$BACKUP_ROOT"/* && "$a2" != *..* ]] || return 1
       fi
       ;;
@@ -1293,15 +1305,221 @@ txn_file_matches() {
 # без маркера повторный откат мог бы затереть изменения администратора.
 journal_mark_restored() {
   local journal="$1" dest="$2" backup="$3"
-  if ! printf 'restored\t%s\t%s\n' "$dest" "$backup" >>"$journal"; then
+  if ! journal_append "$journal" restored "$dest" "$backup"; then
     warn "Не удалось записать отметку восстановления ${dest} в журнал ${journal}"
     return 1
   fi
-  if ! sync "$journal" 2>/dev/null; then
-    warn "Не удалось синхронизировать журнал ${journal}"
-    return 1
+}
+
+# Parse the entire immutable input snapshot BEFORE systemd/filesystem actions.
+# These globals describe validated records only; v1 is never upgraded implicitly.
+journal_validate() {
+  local journal="$1" line action a1 a2 rest i recovery=0 base
+  local -a lines=()
+  local -A used_backups=() other_paths=()
+  RB_JOURNAL_VERSION=1
+  declare -ga RB_JOURNAL_ENTRIES=()
+  declare -gA RB_RESTORE_BACKUP=() RB_RESTORE_PHASE=()
+  [[ -f "$journal" && ! -L "$journal" && -r "$journal" ]] || return 1
+  mapfile -t lines <"$journal" || return 1
+  # Reject truncated final records, embedded NUL and any mapfile normalization.
+  if (( ${#lines[@]} )); then
+    cmp -s -- "$journal" <(printf '%s\n' "${lines[@]}") || return 1
+  fi
+  if [[ "${lines[0]:-}" == "$JOURNAL_V2_HEADER" ]]; then RB_JOURNAL_VERSION=2; fi
+  for ((i=0; i<${#lines[@]}; i++)); do
+    line="${lines[i]}"
+    if [[ "$line" == '# MIFA VPN Basic journal'* ]]; then
+      [[ "$i" == 0 && "$line" == "$JOURNAL_V2_HEADER" ]] || return 1
+      continue
+    fi
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" == *$'\t'*$'\t'* && "$line" != *$'\r'* ]] || return 1
+    action="${line%%$'\t'*}"; rest="${line#*$'\t'}"
+    a1="${rest%%$'\t'*}"; a2="${rest#*$'\t'}"
+    [[ -n "$a1" && "$a2" != *$'\t'* ]] || return 1
+    journal_entry_allowed "$action" "$a1" "$a2" || return 1
+    case "$action" in
+      remove|rmdir|chmeta)
+        [[ -z "${RB_RESTORE_BACKUP[$a1]:-}" ]] || return 1
+        other_paths["$a1"]=1
+        ;;
+    esac
+    case "$action" in
+      restore)
+        (( recovery == 0 )) || return 1
+        [[ -z "${RB_RESTORE_BACKUP[$a1]:-}" && -z "${used_backups[$a2]:-}" &&
+           -z "${other_paths[$a1]:-}" ]] || return 1
+        # The backup must be this destination under one install-* directory.
+        [[ "$a2" == *"$a1" ]] || return 1
+        base="${a2%"$a1"}"; base="${base#"$BACKUP_ROOT"/}"
+        [[ "$base" == install-?* && "$base" != */* ]] || return 1
+        RB_RESTORE_BACKUP["$a1"]="$a2"; used_backups["$a2"]=1
+        RB_RESTORE_PHASE["$a1"]=pending
+        ;;
+      restoring|restored)
+        recovery=1
+        [[ "${RB_RESTORE_BACKUP[$a1]:-}" == "$a2" ]] || return 1
+        if [[ "$action" == restoring ]]; then
+          [[ "$RB_JOURNAL_VERSION" == 2 && "${RB_RESTORE_PHASE[$a1]}" == pending ]] || return 1
+          RB_RESTORE_PHASE["$a1"]=restoring
+        else
+          if [[ "$RB_JOURNAL_VERSION" == 2 ]]; then
+            [[ "${RB_RESTORE_PHASE[$a1]}" == restoring ]] || return 1
+          else
+            [[ "${RB_RESTORE_PHASE[$a1]}" == pending ]] || return 1
+          fi
+          RB_RESTORE_PHASE["$a1"]=restored
+        fi
+        continue
+        ;;
+      chmeta)
+        (( recovery == 0 )) || return 1
+        [[ "$a2" =~ ^[0-7]{3,4}:[0-9]+:[0-9]+$ ]] || return 1
+        ;;
+      *) (( recovery == 0 )) && [[ -z "$a2" ]] || return 1 ;;
+    esac
+    RB_JOURNAL_ENTRIES+=("$line")
+  done
+  if [[ "$RB_JOURNAL_VERSION" == 1 ]]; then
+    for a1 in "${!RB_RESTORE_PHASE[@]}"; do
+      if [[ "${RB_RESTORE_PHASE[$a1]}" != restored ]]; then
+        warn "Неоднозначный v1 restore ${a1}: журнал и данные оставлены для ручного восстановления"
+        return 1
+      fi
+    done
   fi
 }
+
+# Restore is deliberately limited to regular files in trusted parent directories.
+# Check every parent (not only the final component). These checks and the pinned
+# cwd below reduce path substitution; they are NOT a general TOCTOU guarantee
+# against a concurrent privileged process replacing directory entries.
+txn_restore_parents_safe() {
+  local rest="${1#/}" component current='' owner mode
+  [[ "$1" == /* && "$1" != *//* && "$1" != */./* && "$1" != *..* ]] || return 1
+  while [[ "$rest" == */* ]]; do
+    component="${rest%%/*}"; rest="${rest#*/}"; current+="/$component"
+    [[ -d "$current" && ! -L "$current" ]] || return 1
+    IFS=: read -r owner mode <<<"$(stat -c '%u:%a' -- "$current")"
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+  done
+  [[ -n "$rest" ]]
+}
+
+txn_restore_types_safe() {
+  local dest="$1" backup="$2"
+  txn_restore_parents_safe "$dest" && txn_restore_parents_safe "$backup" || return 1
+  [[ -f "$backup" && ! -L "$backup" && ! -L "$dest" ]] || return 1
+  [[ ! -e "$dest" || -f "$dest" ]]
+}
+
+# Independent of cp/mv's exit status. Compare bytes, type, permissions, owner,
+# nanosecond mtime and all readable xattrs (including ACLs). Open final files
+# without following symlinks; uncertainty or unavailable Python fails closed.
+# Python is optional elsewhere in this installer; restore requires it explicitly.
+txn_restore_matches() {
+  local verifier_rc=0
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'MIFA_RESTORE_VERIFIER_ERROR\t127\n' >&2
+    return 2
+  fi
+  if python3 -I - "$1" "$2" <<'PY'
+import os, stat, sys
+
+def metadata(fd):
+    s = os.fstat(fd)
+    if not stat.S_ISREG(s.st_mode):
+        raise ValueError("restore expects a regular file")
+    attrs = {k: os.getxattr(fd, k) for k in os.listxattr(fd)}
+    return (s.st_mode, s.st_uid, s.st_gid, s.st_size, s.st_mtime_ns, attrs)
+
+try:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(sys.argv[1], flags), "rb") as left, \
+         os.fdopen(os.open(sys.argv[2], flags), "rb") as right:
+        original = metadata(left.fileno()), metadata(right.fileno())
+        if original[0] != original[1]:
+            sys.exit(1)
+        while True:
+            a, b = left.read(1024 * 1024), right.read(1024 * 1024)
+            if a != b:
+                sys.exit(1)
+            if not a:
+                break
+        if original != (metadata(left.fileno()), metadata(right.fileno())):
+            sys.exit(1)
+except (OSError, ValueError, AttributeError) as error:
+    print("Restore verification failed: " + str(error), file=sys.stderr)
+    sys.exit(2)
+PY
+  then verifier_rc=0; else verifier_rc=$?; fi
+  if (( verifier_rc > 1 )); then
+    printf 'MIFA_RESTORE_VERIFIER_ERROR\t%s\n' "$verifier_rc" >&2
+    return 2
+  fi
+  return "$verifier_rc"
+}
+
+txn_restore_file() (
+  local journal="$1" dest="$2" backup="$3" phase="$4" parent leaf staging
+  if ! txn_restore_parents_safe "$journal" || ! txn_restore_types_safe "$dest" "$backup"; then
+    warn "Небезопасный тип или родительский путь restore: ${dest}, ${backup}"
+    return 1
+  fi
+  parent="$(dirname -- "$dest")"; leaf="${dest##*/}"
+  cd -P -- "$parent" || return 1
+  [[ "$(pwd -P)" == "$parent" ]] || return 1
+  if [[ "$phase" == restored || "$phase" == restoring ]]; then
+    if ! txn_restore_matches "$backup" "./$leaf"; then
+      warn "Неоднозначный/изменённый restore ${dest}: повторная замена запрещена"
+      return 1
+    fi
+    if [[ "$phase" == restoring ]]; then
+      sync "./$leaf" . 2>/dev/null || return 1
+      journal_mark_restored "$journal" "$dest" "$backup" || return 1
+    fi
+    info "Уже восстановлен ${dest}: содержимое и метаданные совпадают с ${backup}"
+    return 0
+  fi
+  [[ "$phase" == pending && "$RB_JOURNAL_VERSION" == 2 ]] || return 1
+  command -v python3 >/dev/null 2>&1 || {
+    warn 'Для проверки restore нужен python3'
+    printf 'MIFA_RESTORE_VERIFIER_ERROR\t127\n' >&2
+    return 1
+  }
+  # Persist intent even if the destination already equals the backup. Any retry
+  # after this point is verify-only and cannot replace an administrator's file.
+  journal_append "$journal" restoring "$dest" "$backup" || return 1
+  test_fault restore_after_intent
+  staging="$(mktemp -d -- ./.mifa-restore.XXXXXXXXXX)" || return 1
+  info "Staging восстановления: ${parent}/${staging#./}"
+  # Never reuse/clean a discovered name; only the newly created private dir.
+  # On ANY failure leave it for inspection, with journal+backup retained.
+  if ! cp -a -- "$backup" "$staging/payload" ||
+     ! txn_restore_matches "$backup" "$staging/payload" ||
+     ! sync "$staging/payload" "$staging" . 2>/dev/null; then
+    warn "Staging restore сохранён для диагностики: ${parent}/${staging#./}"
+    return 1
+  fi
+  test_fault restore_before_replace
+  if ! txn_restore_types_safe "$dest" "$backup" || [[ "$(pwd -P)" != "$parent" ]] ||
+     ! mv -fT -- "$staging/payload" "./$leaf"; then
+    warn "Замена restore не выполнена; staging сохранён: ${parent}/${staging#./}"
+    return 1
+  fi
+  test_fault restore_after_replace
+  if ! txn_restore_types_safe "$dest" "$backup" ||
+     ! txn_restore_matches "$backup" "./$leaf" || ! sync "./$leaf" . 2>/dev/null; then
+    warn "Результат restore не подтверждён: ${dest}; staging сохранён: ${parent}/${staging#./}"
+    return 1
+  fi
+  journal_mark_restored "$journal" "$dest" "$backup" || return 1
+  # No recursive deletion, and only the empty directory created by this call.
+  rmdir -- "$staging" || return 1
+  info "Восстановлен ${dest} из ${backup}"
+)
 
 # Остановка сервиса - критическое действие отката: недоступность systemd и
 # неизвестное состояние считаются ошибкой.
@@ -1346,8 +1564,7 @@ txn_disable_unit() {
 
 txn_rollback() {
   local journal="${1:-$JOURNAL}" i action a1 a2 m u g entry rmstate=0 rc=0 blocked=0 skipped=0 leftover=""
-  local -a lines=() entries=()
-  local -A restored=()
+  local -a entries=()
   set +e
   trap - ERR
   if [[ ! -e "$journal" && ! -L "$journal" ]]; then
@@ -1355,7 +1572,7 @@ txn_rollback() {
     return 0
   fi
   # Ошибка чтения журнала: ни одно действие не выполняется, журнал сохраняется.
-  if [[ ! -f "$journal" || ! -r "$journal" ]] || ! mapfile -t lines <"$journal"; then
+  if [[ ! -f "$journal" || -L "$journal" || ! -r "$journal" ]]; then
     TXN_ACTIVE=0
     warn "Не удалось прочитать журнал ${journal}: ни одно действие отката не выполнено"
     warn "Журнал и резервные копии в ${BACKUP_ROOT} сохранены; устраните причину и повторите: sudo bash install.sh --rollback"
@@ -1364,20 +1581,14 @@ txn_rollback() {
   warn "Откат изменений по журналу ${journal}"
   # Предварительная проверка всех записей. Любая недопустимая или повреждённая
   # запись прерывает откат до изменений системы: журнал сохраняется.
-  for ((i = ${#lines[@]} - 1; i >= 0; i--)); do
-    [[ -z "${lines[i]}" || "${lines[i]}" == \#* ]] && continue
-    IFS=$'\t' read -r action a1 a2 <<<"${lines[i]}"
-    if ! journal_entry_allowed "$action" "$a1" "$a2"; then
-      TXN_ACTIVE=0
-      warn "Недопустимая запись журнала: ${lines[i]}"
-      warn "Откат прерван до изменений системы: журнал ${journal} сохранён"
-      warn "Исправьте журнал или выполните ручную очистку (docs/RECOVERY.md, раздел 6)"
-      return "$RC_ROLLBACK_INCOMPLETE"
-    fi
-    entries+=("${action}"$'\t'"${a1}"$'\t'"${a2}")
-    if [[ "$action" == "restored" ]]; then
-      restored["$a1"]="$a2"
-    fi
+  if ! journal_validate "$journal"; then
+    TXN_ACTIVE=0
+    warn "Недопустимая запись журнала или неоднозначный протокол: ${journal}"
+    warn "Откат прерван до изменений системы: журнал ${journal} сохранён"
+    return "$RC_ROLLBACK_INCOMPLETE"
+  fi
+  for ((i = ${#RB_JOURNAL_ENTRIES[@]} - 1; i >= 0; i--)); do
+    entries+=("${RB_JOURNAL_ENTRIES[i]}")
   done
   # Фаза 1: сервис. Пока остановка и отключение не подтверждены, файловые
   # действия не выполняются - независимо от порядка записей в журнале.
@@ -1419,26 +1630,7 @@ txn_rollback() {
         fi
         ;;
       restore)
-        if [[ -n "${restored[$a1]:-}" ]]; then
-          if txn_file_matches "$a2" "$a1"; then
-            info "Уже восстановлен ${a1}: содержимое и метаданные совпадают с ${a2}"
-          else
-            warn "Файл ${a1} изменён после восстановления: не перезаписывается, решение за администратором"
-            rc=1
-          fi
-        elif txn_file_matches "$a2" "$a1"; then
-          info "Уже восстановлен ${a1}: содержимое и метаданные совпадают с ${a2}"
-          journal_mark_restored "$journal" "$a1" "$a2" \
-            || { warn "Не удалось отметить восстановление ${a1} в журнале"; rc=1; }
-        elif cp -a -- "$a2" "${a1}.mifa-restore" && mv -f -- "${a1}.mifa-restore" "$a1"; then
-          info "Восстановлен ${a1} из ${a2}"
-          journal_mark_restored "$journal" "$a1" "$a2" \
-            || { warn "Не удалось отметить восстановление ${a1} в журнале"; rc=1; }
-        else
-          rm -f -- "${a1}.mifa-restore"
-          warn "Не удалось восстановить ${a1} из ${a2}"
-          rc=1
-        fi
+        txn_restore_file "$journal" "$a1" "$a2" "${RB_RESTORE_PHASE[$a1]}" || rc=1
         ;;
       userdel)
         if id -u "$a1" >/dev/null 2>&1; then

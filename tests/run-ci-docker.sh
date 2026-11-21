@@ -10,7 +10,7 @@ case "$suite" in rollback|rollback-systemd|e2e) ;; *) exit 2 ;; esac
   || { echo 'CI reporting requires one explicit MIFA_ROLLBACK_CASE; use run-docker.sh for the full suite' >&2; exit 2; }
 case "$ubuntu" in 22.04|24.04|26.04) ;; *) exit 2 ;; esac
 scenario="${MIFA_ROLLBACK_CASE:-$suite}"
-[[ "$scenario" =~ ^[a-z][a-z-]*$ ]] || exit 2
+[[ "$scenario" =~ ^[a-z][a-z0-9-]*$ ]] || exit 2
 [[ -z "$confirmation" || "$confirmation" == --disposable-linux-vm ]] || exit 2
 command -v python3 >/dev/null || { echo 'Python 3 required for CI evidence reporting' >&2; exit 2; }
 # Refuse reuse/symlinks rather than overwriting an earlier run's evidence.

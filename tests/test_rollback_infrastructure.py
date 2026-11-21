@@ -8,6 +8,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import shlex
@@ -165,6 +166,28 @@ class BaselinePlan(unittest.TestCase):
         self.assertFalse(result["run_systemd"])
         self.assertEqual(result["profile"], "push-smoke")
 
+    def test_p14_push_selects_exact_target_and_never_systemd(self):
+        source = (TESTS / "rollback_regressions.sh").read_text(encoding="utf-8")
+        catalog = re.search(r"CASES=\((.*?)\)", source, re.S).group(1).split()
+        event = {"head_commit": {"message": "test: p14 [baseline-smoke]"},
+                 "inputs": {"ubuntu": "all", "run_systemd": True, "disposable_linux_vm": True}}
+        result = planner.select("push", planner.BRANCH, event, catalog, "p14")
+        expected = planner.P14_CONTROLS + [c for c in catalog if c.startswith("restore-")] + planner.P14_NEGATIVE
+        self.assertEqual(result["scenarios"], expected)
+        self.assertEqual(len(result["scenarios"]), 28)
+        self.assertEqual(result["versions"], ["24.04"])
+        self.assertFalse(result["run_systemd"])
+        self.assertEqual(result["profile"], "push-p14")
+        self.assertNotIn("repeat-rmdir", result["scenarios"])
+        with self.assertRaises(ValueError):
+            planner.select("push", planner.BRANCH, {"head_commit": {"message": "ordinary push"}}, catalog, "p14")
+        with self.assertRaises(ValueError):
+            planner.select("push", "refs/heads/main", event, catalog, "p14")
+        with self.assertRaises(ValueError):
+            planner.select("push", planner.BRANCH, event, catalog, "bogus")
+        with self.assertRaises(ValueError):
+            planner.select("push", planner.BRANCH, event, planner.SMOKE, "p14")
+
     def test_ordinary_push_and_other_branch_cannot_select_tests(self):
         for ref, message in [(planner.BRANCH, "ordinary push"),
                              ("refs/heads/main", "[baseline-smoke]"),
@@ -273,6 +296,13 @@ class ResultEvidence(unittest.TestCase):
             result = reporter.classify("rollback", self.failure + marker + "\n", 1, 0)
             self.assertEqual(result["classification"], classification)
             self.assertEqual(result["assertions_failed"], 1)
+
+    def test_restore_verifier_errors_never_become_pass_or_assertion_failures(self):
+        for rc, summary in [(0, self.success), (1, self.failure), (3, self.success)]:
+            result = reporter.classify("rollback", summary + "MIFA_RESTORE_VERIFIER_ERROR\t2\n", rc, 0)
+            self.assertEqual(result["classification"], "RESTORE_VERIFIER_ERROR")
+            self.assertEqual(result["restore_verifier_exit_codes"], [2])
+            self.assertNotEqual(result["effective_exit_code"], 0)
 
 
 @unittest.skipUnless(options.bash, "Bash unavailable")
@@ -503,6 +533,24 @@ class RunnerGuards(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(result.report["expected_before_fixes"], "PASS")
         self.assertEqual(result.report["status"], "PASS")
+
+    def test_p14_expectations_do_not_suppress_negative_control(self):
+        for case, rc, expected in [("staging-symlink", "0", "PASS"), ("repeat-remove", "1", "FAIL")]:
+            result, _, _ = self.run_runner("rollback", ci_capture=True, MIFA_ROLLBACK_CASE=case,
+                                          FAKE_TEST_RC=rc, MIFA_BASELINE_PROFILE="push-p14")
+            self.assertEqual(result.returncode, int(rc))
+            self.assertEqual(result.report["expected_this_run"], expected)
+            self.assertEqual(result.report["expected_before_fixes"], "FAIL")
+
+    def test_v1_named_scenario_reaches_ci_runner_and_reports(self):
+        result, calls, survivors = self.run_runner("rollback", ci_capture=True,
+                                                  MIFA_ROLLBACK_CASE="restore-v1-unmarked",
+                                                  MIFA_BASELINE_PROFILE="push-p14")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("rollback_regressions.sh restore-v1-unmarked", calls)
+        self.assertEqual(result.report["scenario"], "restore-v1-unmarked")
+        self.assertEqual(result.report["expected_this_run"], "PASS")
+        self.assertEqual(survivors, 0)
 
     def test_ci_report_rejects_zero_exit_without_completion_evidence(self):
         result, _, _ = self.run_runner("rollback", ci_capture=True,
