@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-Free_Noncommercial-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu-orange)
 
-Minimal, production-ready installer for Xray (VLESS + Reality)
+Minimal Xray (VLESS + Reality) installer for a **clean Ubuntu VPS**. The installer's security and compatibility hardening is in progress; it is not yet a general-purpose migration tool.
 
 > Default RU-friendly port: **8443**  
 > Supports modern **Xray v26+ (Password/pbk format)**  
@@ -19,8 +19,7 @@ If you need:
 - Modular architecture  
 - Production-grade observability  
 
-Check out the **MIFA VPN Platform** edition:
-https://github.com/kolpakovden/mifa-vpn-platform
+The advanced architecture is maintained in **[MIFA VPN Core](https://github.com/kolpakovden/mifa-vpn-core)** (currently a private development repository). The former [MIFA VPN Platform](https://github.com/kolpakovden/mifa-vpn-platform) is preserved only for historical reference.
 
 ---
 
@@ -56,6 +55,22 @@ The script automatically detects and parses the correct format.
 
 ## Installation
 
+**Important: fresh hosts only.** The installer now rejects a machine with an existing Xray executable, configuration or running Xray service before attempting to write a config. Never run it to update a production VPN. Do not assume a fixed SNI/target is valid for every network; verify it before using a profile.
+
+Recommended: start with a fresh Ubuntu VPS. Allow the selected TCP port in your VPS provider firewall and any local firewall. Save the generated VLESS link securely. Test from a separate device/network before relying on it.
+
+```bash
+git clone https://github.com/kolpakovden/mifa-vpn-basic.git
+cd mifa-vpn-basic
+sudo bash install.sh --port 8443 --sni vpn.example.com --target vpn.example.com:443
+```
+
+Replace `vpn.example.com` with a **verified compatible REALITY handshake target**; this is a parameter example, not a ready-to-use SNI. An automated compatibility test will be added before the next public release.
+
+The script currently contains legacy installation paths and does not yet implement complete rollback. Track production-readiness work in [Issue #1](https://github.com/kolpakovden/mifa-vpn-basic/issues/1).
+
+### Legacy quick start
+
 ```
 git clone https://github.com/kolpakovden/MIFA-VPN-basic.git
 cd MIFA-VPN-basic
@@ -82,7 +97,7 @@ You are responsible for proper operational security (OPSEC).
 
 ## Edition Comparison
 
-| Feature | Basic | Platform |
+| Feature | Basic | Core (private development) |
 |----------|--------|-----------|
 | Xray (VLESS + Reality) |   ✅ |   ✅ |
 | Telegram Bot |   ❌ |   ✅ |
