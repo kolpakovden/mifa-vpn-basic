@@ -14,7 +14,7 @@
 **2.** Скачайте стабильную версию:
 
 ```bash
-git clone --depth 1 --branch v1.1.0 https://github.com/kolpakovden/mifa-vpn-basic.git
+git clone --depth 1 --branch v1.1.1 https://github.com/kolpakovden/mifa-vpn-basic.git
 cd mifa-vpn-basic
 ```
 
