@@ -1,72 +1,38 @@
-MIFA Free Noncommercial License, Version 1.0
-Effective date: 2026-10-24
-SPDX-License-Identifier: LicenseRef-MIFA-Free-Noncommercial-1.0
+# MIFA Free Noncommercial License 1.1 (Draft)
+SPDX-License-Identifier: LicenseRef-MIFA-Free-Noncommercial-1.1
+Copyright (c) 2025 KolpakovDen  
+https://github.com/kolpakovden/mifa-vpn-basic
 
-Copyright (c) 2025 KolpakovDen
-Project: https://github.com/kolpakovden/mifa-vpn-basic
+## 1. Permissions
 
-1. Scope and permission
+Permission is granted worldwide, free of charge and on a nonexclusive basis, to use, study, copy, modify and redistribute the author's project code and documentation, including modified versions, **for noncommercial purposes only**.
 
-Subject to these terms, the copyright holder grants everyone a worldwide,
-royalty-free, nonexclusive permission to obtain, use, study, copy, modify and
-redistribute the original project code, configuration templates and
-documentation (the "Materials") for noncommercial purposes only.
-No fee or registration is required to exercise these permissions.
+No registration or payment is required.
 
-This grant covers only rights controlled by the copyright holder. Third-party
-code, software, documentation and other third-party materials remain subject
-to their own licenses and notices. This license does not relicense them.
+## 2. Restrictions
 
-2. Free access and redistribution
+The project and its modifications must not be:
 
-Copies and modified versions of the Materials may be shared only free of
-charge. Preserve this license, copyright notices and the project URL above in
-all copies or substantial portions. Clearly identify modified versions and
-the changes made. Do not represent modifications as an official release.
+- Sold, rented or distributed for a fee.
+- Used to provide paid VPN, subscription or other monetized services.
+- Used for paid installation, deployment, configuration, integration, migration, hosting, administration, maintenance, support, consulting or training.
+- Bundled with paid products or services or otherwise used primarily for commercial advantage or compensation.
 
-3. Prohibited commercial activities
+    These restrictions apply to direct and indirect payments.
+    Users may pay independent providers for their own servers and Internet connections used for permitted noncommercial purposes.
+    Redistribution requires retaining this license, copyright notices and the project URL. Modifications must be identified and must not be presented as official releases.
 
-No permission is granted under this license to:
-(a) sell, rent, sublicense for a fee, or charge for access to the Materials
-    or modified versions;
-(b) use the Materials or modified versions to operate, supply or support
-    a paid VPN, subscription service or other monetized service;
-(c) charge for installation, deployment, configuration, integration,
-    migration, hosting, administration, maintenance, support, consulting
-    or training relating to the Materials or modified versions;
-(d) bundle the Materials or modified versions with a paid product or
-    service, or use them for another purpose primarily directed toward
-    commercial advantage or monetary compensation.
+## 3. Previous and Third-Party Licenses
 
-These restrictions apply whether payment is direct or indirect and whether
-the Materials are modified or unmodified. They do not prohibit a user from
-paying an independent infrastructure provider for their own server or Internet
-connection for otherwise permitted noncommercial use. No rights over such
-independent third-party infrastructure or software are claimed.
+    Previously granted rights under MIT or other licenses remain valid and are not revoked or restricted. This license does not retroactively apply to materials already licensed under those terms.
+    Third-party components remain subject to their respective licenses. This license grants only rights controlled by the copyright holder.
 
-4. Earlier licenses
+## 4. Termination
 
-This license does not revoke, replace or restrict permissions already granted
-under MIT or another license for earlier copies or versions. Material
-previously released under MIT remains usable under that grant. A recipient may
-rely on that earlier grant for the material it covers. This license governs
-new grants made under these terms only; it does not retroactively impose
-noncommercial restrictions on previously licensed material.
+    Rights not expressly granted are reserved. Permissions under this license terminate automatically upon violation of its terms, without affecting independent rights under earlier or third-party licenses.
 
-5. Reservation and termination
+## 5. Disclaimer
 
-All rights not expressly granted are reserved. Permissions under this license
-terminate automatically if its conditions are violated. Termination does not
-affect independent rights granted under an earlier or third-party license.
-
-6. Disclaimer
-
-THE MATERIALS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. TO THE EXTENT PERMITTED
-BY APPLICABLE LAW, IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
-FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION
-WITH THE MATERIALS OR THEIR USE.
-
-This is a custom source-available noncommercial license, not the MIT License
-and not an OSI-approved open source license.
+    THE MATERIALS ARE PROVIDED "AS IS", WITHOUT WARRANTIES OF ANY KIND, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+    TO THE EXTENT PERMITTED BY LAW, THE AUTHORS AND COPYRIGHT HOLDERS SHALL NOT BE LIABLE FOR DAMAGES OR CLAIMS ARISING FROM THE MATERIALS OR THEIR USE.
+    This is a custom noncommercial source-available license, not an OSI-approved open source license.
