@@ -90,6 +90,8 @@ WRAPPER
   done
 }
 
+# RB_RC is this sourced helper's result; callers in regression scripts read it.
+# shellcheck disable=SC2034
 observed_rollback() {
   cp -a -- "$JOURNAL" "$W/journal-before" || return 2
   RB_OBSERVER_RUN="$(mktemp -d "$W/observation.XXXXXXXX")" || return 2

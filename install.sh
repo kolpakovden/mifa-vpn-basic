@@ -2439,7 +2439,7 @@ main() {
     rollback)
       require_root
       acquire_lock
-      if ! do_rollback_mode; then
+      if ! do_rollback_mode "$JOURNAL"; then
         exit "$RC_ROLLBACK_INCOMPLETE"
       fi
       ;;

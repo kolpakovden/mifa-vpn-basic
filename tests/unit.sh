@@ -268,6 +268,8 @@ exit 0
 EOS
   chmod 0755 "${MOCK_DIR}/systemctl" "${MOCK_DIR}/userdel" "${MOCK_DIR}/id"
 }
+# PATH isolation is intentional; the replacement function is called via "$@".
+# shellcheck disable=SC2030,SC2031,SC2317
 run_mock() { # функция и аргументы; systemctl/userdel/id - заглушки из MOCK_DIR
   (
     PATH="${MOCK_DIR}:${PATH}"
@@ -276,6 +278,8 @@ run_mock() { # функция и аргументы; systemctl/userdel/id - за
     "$@"
   ) 2>&1
 }
+# Same deliberate subshell isolation and indirect mock invocation as run_mock.
+# shellcheck disable=SC2030,SC2031,SC2317
 run_mock_nosystemd() { # как run_mock, но systemd недоступен
   (
     PATH="${MOCK_DIR}:${PATH}"
@@ -351,6 +355,8 @@ t_section "txn_rollback: сбой daemon-reload"
 make_mocks inactive disabled loaded 1
 out="$(
   # This unit test isolates daemon-reload failure after established ownership.
+  # The replacement is invoked indirectly by run_mock -> txn_rollback.
+  # shellcheck disable=SC2317
   txn_quiesce_service() { RB_SERVICE_MANAGED=1; return 0; }
   run_mock txn_rollback "$RJ"
 )"; rc=$?
