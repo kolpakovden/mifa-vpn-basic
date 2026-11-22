@@ -15,6 +15,7 @@ def classify(suite, console, runner_rc, log_rc):
     probe_errors = [int(code) for code in re.findall(r"^MIFA_PROBE_ERROR\t(\d+)\r?$", console, re.MULTILINE)]
     probe_infra_errors = [int(code) for code in re.findall(r"^MIFA_PROBE_INFRA_ERROR\t(\d+)\r?$", console, re.MULTILINE)]
     verifier_errors = [int(code) for code in re.findall(r"^MIFA_RESTORE_VERIFIER_ERROR\t(\d+)\r?$", console, re.MULTILINE)]
+    ownership_errors = [int(code) for code in re.findall(r"^MIFA_V3_INFRA_ERROR\t(\d+)\r?$", console, re.MULTILINE)]
     name = "rollback-regressions" if suite == "rollback" else suite
     summaries = re.findall(rf"^{re.escape(name)}: пройдено (\d+), ошибок (\d+)\r?$",
                            console, re.MULTILINE)
@@ -25,7 +26,7 @@ def classify(suite, console, runner_rc, log_rc):
     evidence_rc = test_rc if test_rc is not None else runner_rc
     if verifier_errors:
         classification = "RESTORE_VERIFIER_ERROR"
-    elif probe_infra_errors:
+    elif ownership_errors or probe_infra_errors:
         classification = "INFRASTRUCTURE_ERROR"
     elif probe_errors:
         classification = "PROBE_EXECUTION_ERROR"
@@ -54,6 +55,7 @@ def classify(suite, console, runner_rc, log_rc):
             "test_classification": test_classification, "test_exit_code": test_rc,
             "cleanup_errors": cleanup_errors, "probe_exit_codes": probe_errors,
             "restore_verifier_exit_codes": verifier_errors,
+            "ownership_infrastructure_exit_codes": ownership_errors,
             "probe_infrastructure_exit_codes": probe_infra_errors,
             "status": "PASS" if effective_rc == 0 else "FAIL",
             "summary_completed": completed,
@@ -68,10 +70,14 @@ def main():
     console = (output / "console.log").read_text(encoding="utf-8", errors="replace")
     report = classify(suite, console, runner_rc, log_rc)
     expected = "PASS" if scenario in ("control-remove", "control-restore", "e2e") else "FAIL"
+    if scenario.startswith("v3-"):
+        expected = "NOT_ESTABLISHED"
     profile = os.environ.get("MIFA_BASELINE_PROFILE", "")
     target_expected = None
     if profile == "push-p14":
         target_expected = "FAIL" if scenario in ("repeat-remove", "parent-chmeta", "enable-without-stop") else "PASS"
+    elif profile == "v3-smoke":
+        target_expected = "FAIL" if scenario == "enable-without-stop" else "PASS"
     report.update(ubuntu=ubuntu, scenario=scenario, expected_before_fixes=expected,
                   expected_this_run=target_expected,
                   runner_exit_code=runner_rc, log_exit_code=log_rc,
@@ -83,9 +89,9 @@ def main():
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
         sha = "unavailable"
     summary = (
-        "| Ubuntu | Scenario | Expected before fixes | Actual | Classification | Runner exit | Log exit |\n"
-        "| --- | --- | --- | --- | --- | --- | --- |\n"
-        f"| {ubuntu} | {scenario} | {expected} | **{report['status']}** | "
+        "| Ubuntu | Scenario | Expected before fixes | Expected this run | Actual | Classification | Runner exit | Log exit |\n"
+        "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+        f"| {ubuntu} | {scenario} | {expected} | {target_expected or 'not specified'} | **{report['status']}** | "
         f"{report['classification']} | {runner_rc} | {log_rc} |\n\n"
         f"Commit: `{sha}`. Reporting exit: {report['effective_exit_code']}.\n\n"
         f"Target profile expectation: {target_expected or 'not specified'}. Actual failures are never suppressed.\n\n"
@@ -93,10 +99,17 @@ def main():
         f"Cleanup failures (all attempts): `{json.dumps(report['cleanup_errors'])}`.\n\n"
         f"Probe execution errors: {report['probe_exit_codes']}; probe infrastructure errors: {report['probe_infrastructure_exit_codes']}.\n\n"
         f"Production restore verifier errors: {report['restore_verifier_exit_codes']}.\n\n"
+        f"v3 ownership infrastructure errors: {report['ownership_infrastructure_exit_codes']}.\n\n"
         "Expected FAIL is a hypothesis. TEST_ASSERTIONS_FAILED means assertions completed with failures; "
         "inspect individual assertions before claiming defect reproduction. Infrastructure errors, "
         "missing/contradictory summaries and timeouts are not reproduced defects.\n"
     )
+    if profile == "v3-smoke" and scenario == "enable-without-stop":
+        summary += (
+            "\nKnown observer limit: execve coverage excludes Python descriptor filesystem operations. "
+            "Inspect the independent ActiveState/stop assertions for P1-5; missing external "
+            "chmod/chown/rmdir observations alone do not reproduce that defect.\n"
+        )
     (output / "summary.md").write_text(summary, encoding="utf-8")
     print(summary)
     return report["effective_exit_code"]

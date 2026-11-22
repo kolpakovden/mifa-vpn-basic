@@ -139,7 +139,10 @@ sudo cat /var/lib/mifa-vpn-basic/client.txt
 | `/var/lib/mifa-vpn-basic/manifest` | `root:root 0600` | список файлов установки для `uninstall.sh` |
 | пользователь `xray` | без shell и home | от него работает сервис |
 
-Пакет `unzip` ставится через `apt-get`, только если нет ни `unzip`, ни `python3`.
+Для journal v3 обязательны Python 3 и поддержка user xattrs файловой системой.
+Без Python 3 preflight отказывает до установки; архив распаковывается через
+имеющийся `unzip` или стандартный модуль Python. Гарантии нового rollback
+ещё требуют Linux-регрессий (см. `docs/RECOVERY.md`).
 SSH, firewall и другие сервисы не изменяются.
 
 ## Порты и firewall

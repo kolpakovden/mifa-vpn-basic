@@ -195,6 +195,35 @@ class BaselinePlan(unittest.TestCase):
             with self.subTest(ref=ref, message=message), self.assertRaises(ValueError):
                 planner.select("push", ref, {"head_commit": {"message": message}}, self.catalog)
 
+    @unittest.skipUnless(options.bash, "Bash unavailable")
+    def test_v3_smoke_uses_real_catalog_and_fixed_unprivileged_matrix(self):
+        # Execute the read-only catalog, including its generated v3 names.
+        catalog = subprocess.check_output([options.bash, str(TESTS / "rollback_regressions.sh"), "--list"],
+                                          text=True, encoding="utf-8", timeout=10).splitlines()
+        expected = ["control-remove", "control-restore", "repeat-remove", "repeat-rmdir",
+                    "repeat-chmeta", "repeat-userdel", "v3-remove-created-kill",
+                    "v3-remove-after-replaced", "v3-rmdir-copied-generation", "v3-chmeta-partial",
+                    "v3-userdel-group-kill", "v3-userdel-copied-generation", "v3-chmeta-intent-sync",
+                    "restore-after-replace-interrupted", "staging-symlink", "enable-without-stop"]
+        event = {"head_commit": {"message": "test: v3 [baseline-smoke]"},
+                 "inputs": {"ubuntu": "all", "scenarios": "all", "run_systemd": True,
+                            "disposable_linux_vm": True}}
+        plan = planner.select("push", planner.BRANCH, event, catalog, "v3-smoke")
+        self.assertEqual(plan, dict(versions=["24.04"], scenarios=expected,
+                                    run_systemd=False, profile="v3-smoke"))
+        self.assertEqual(len(expected), len(set(expected)))
+        self.assertEqual(len(expected), 16)
+        for name in expected:
+            with self.subTest(missing=name), self.assertRaises(ValueError):
+                planner.select("push", planner.BRANCH, event, [c for c in catalog if c != name], "v3-smoke")
+
+    def test_v3_smoke_cannot_bypass_push_opt_in(self):
+        for ref, event in [(planner.BRANCH, {"head_commit": {"message": "ordinary push"}}),
+                           ("refs/heads/main", {"head_commit": {"message": "[baseline-smoke]"}}),
+                           (planner.BRANCH, {"deleted": True, "head_commit": {"message": "[baseline-smoke]"}})]:
+            with self.subTest(ref=ref, event=event), self.assertRaises(ValueError):
+                planner.select("push", ref, event, planner.V3_SMOKE, "v3-smoke")
+
     def test_deleted_branch_missing_head_and_pr_are_rejected(self):
         for event in [{}, {"head_commit": None},
                       {"deleted": True, "head_commit": {"message": "[baseline-smoke]"}}]:
@@ -302,6 +331,13 @@ class ResultEvidence(unittest.TestCase):
             result = reporter.classify("rollback", summary + "MIFA_RESTORE_VERIFIER_ERROR\t2\n", rc, 0)
             self.assertEqual(result["classification"], "RESTORE_VERIFIER_ERROR")
             self.assertEqual(result["restore_verifier_exit_codes"], [2])
+            self.assertNotEqual(result["effective_exit_code"], 0)
+
+    def test_v3_ownership_errors_are_not_pass_or_assertion_failures(self):
+        for rc, summary in [(0, self.success), (1, self.failure), (3, self.success)]:
+            result = reporter.classify("rollback", summary + "MIFA_V3_INFRA_ERROR\t2\n", rc, 0)
+            self.assertEqual(result["classification"], "INFRASTRUCTURE_ERROR")
+            self.assertEqual(result["ownership_infrastructure_exit_codes"], [2])
             self.assertNotEqual(result["effective_exit_code"], 0)
 
 
@@ -551,6 +587,35 @@ class RunnerGuards(unittest.TestCase):
         self.assertEqual(result.report["scenario"], "restore-v1-unmarked")
         self.assertEqual(result.report["expected_this_run"], "PASS")
         self.assertEqual(survivors, 0)
+
+    def test_v3_smoke_expectations_do_not_change_real_exits(self):
+        for case, rc, expected in [("repeat-userdel", "0", "PASS"),
+                                   ("v3-chmeta-intent-sync", "1", "PASS"),
+                                   ("enable-without-stop", "1", "FAIL")]:
+            result, calls, survivors = self.run_runner("rollback", ci_capture=True, MIFA_ROLLBACK_CASE=case,
+                                                      FAKE_TEST_RC=rc, MIFA_BASELINE_PROFILE="v3-smoke",
+                                                      GITHUB_ACTIONS="true", RUNNER_ENVIRONMENT="github-hosted",
+                                                      RUNNER_OS="Linux", GITHUB_EVENT_NAME="push",
+                                                      FAKE_ENDPOINT="unix:///var/run/docker.sock")
+            self.assertEqual(result.returncode, int(rc))
+            self.assertEqual(result.report["expected_this_run"], expected)
+            self.assertEqual(result.report["test_exit_code"], int(rc))
+            self.assertEqual(result.report["classification"], "PASS" if rc == "0" else "TEST_ASSERTIONS_FAILED")
+            self.assertNotIn("--privileged", calls)
+            self.assertNotIn("--cgroupns", calls)
+            self.assertNotIn("systemd.iid", calls)
+            creates = [line for line in calls.splitlines() if " create " in line]
+            self.assertEqual(len(creates), 1)
+            self.assertIn("--network none", creates[0])
+            self.assertIn("dst=/src,readonly", creates[0])
+            self.assertEqual(creates[0].count("--mount "), 1)
+            for forbidden in ("--pid", "--userns", "--cap-add", "/sys/fs/cgroup", "dst=/etc", "dst=/var/run/docker.sock"):
+                self.assertNotIn(forbidden, creates[0])
+            self.assertEqual(survivors, 0)
+            if case.startswith("v3-"):
+                self.assertEqual(result.report["expected_before_fixes"], "NOT_ESTABLISHED")
+            if case == "enable-without-stop":
+                self.assertIn("execve coverage excludes Python", result.summary)
 
     def test_ci_report_rejects_zero_exit_without_completion_evidence(self):
         result, _, _ = self.run_runner("rollback", ci_capture=True,

@@ -25,6 +25,17 @@ CASES=(control-remove control-restore repeat-remove repeat-rmdir repeat-chmeta
        restore-destination-symlink restore-backup-symlink restore-backup-directory
        restore-v1-unmarked restore-v1-matching-unmarked restore-v1-completed)
 
+# Each generated case still gets its own fresh, unprivileged container.
+for kind in remove rmdir chmeta userdel; do
+  CASES+=("v3-$kind-control" "v3-$kind-replaced" "v3-$kind-copied-generation")
+  for point in before after after-replaced before-done prepare-kill ready-kill intent-write intent-sync done-write done-sync prepare-write prepare-sync ready-write ready-sync; do
+    CASES+=("v3-$kind-$point")
+  done
+  for version in 1 2; do CASES+=("v3-legacy-v$version-$kind"); done
+done
+CASES+=(v3-chmeta-partial v3-userdel-existing-group v3-userdel-group-kill
+       v3-remove-created-kill v3-rmdir-created-kill v3-v2-restore-control)
+
 # Listing does not source install.sh or perform any filesystem/account mutation.
 if [[ "${1:-}" == --list ]]; then
   printf '%s\n' "${CASES[@]}"
@@ -119,7 +130,7 @@ prepare_restore() {
   chmod 0600 "$MANIFEST"
   save_snapshot "$MANIFEST" "$W/original-manifest.json"
   txn_begin
-  must grep -Fxq "$JOURNAL_V2_HEADER" "$JOURNAL"
+  must grep -Fxq "$JOURNAL_V3_HEADER" "$JOURNAL"
   txn_install_file "$W/source" "$MANIFEST" 0600 root root
   save_snapshot "$MANIFEST" "$W/destination-before.json"
   save_snapshot "$BACKUP_DIR" "$W/backup-before.json"
@@ -175,6 +186,11 @@ FAULTS
 
 t_section "$CASE"
 case "$CASE" in
+  v3-*)
+    # Sourced only AFTER all disposable-container guards and fixture setup.
+    # shellcheck source=tests/rollback_v3_cases.sh
+    . "${TESTS_DIR}/rollback_v3_cases.sh"
+    ;;
   control-remove)
     txn_begin
     txn_install_file "$W/source" "$XRAY_BIN" 0755 root root
@@ -389,10 +405,10 @@ case "$CASE" in
         fi
         ;;
       restore-v1-*)
-        # Deliberately remove the exact version header to create a real v1.
-        tail -n +2 "$JOURNAL" >"$W/v1-journal"
-        cat "$W/v1-journal" >"$JOURNAL"
+        # A genuine legacy restore-only journal, not v3 records with no header.
+        printf 'restore\t%s\t%s\n' "$MANIFEST" "$BACKUP_PATH" >"$JOURNAL"
         if [[ "$CASE" == restore-v1-matching-unmarked || "$CASE" == restore-v1-completed ]]; then
+          mv -T -- "$MANIFEST" "$W/v1-installed-manifest"
           cp -a -- "$BACKUP_PATH" "$MANIFEST"
         fi
         if [[ "$CASE" == restore-v1-completed ]]; then

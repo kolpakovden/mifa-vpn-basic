@@ -129,11 +129,15 @@ assert_true "каталог состояния сохранён вместе с 
 out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
 assert_rc "повторный --rollback с тем же журналом: снова код 3" 3 "$rc"
 assert_true "журнал сохранён после повтора" test -e "$jf"
-# После исправления журнала откат завершается и удаляет служебный каталог.
+# Даже разрешённые имена в старом журнале не доказывают принадлежность.
 printf 'remove\t/usr/local/bin/xray\t\nrmdir\t/var/lib/mifa-vpn-basic\t\n' >"$jf"
 out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
-assert_rc "повторный --rollback после исправления: код 0" 0 "$rc"
-assert_false "журнал удалён" test -e "$jf"
+assert_rc "legacy undo без свидетельства: код 3" 3 "$rc"
+assert_true "legacy журнал сохранён" test -e "$jf"
+assert_true "legacy бинарник сохранён" test -e /usr/local/bin/xray
+# These exact paths were created above, inside this disposable test container.
+rm -f -- /usr/local/bin/xray "$jf"
+rmdir -- /var/lib/mifa-vpn-basic
 assert_clean "после --rollback"
 out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
 assert_rc "повторный --rollback: нечего откатывать" 0 "$rc"

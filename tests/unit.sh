@@ -319,7 +319,7 @@ out="$(run_mock txn_disable_unit xray.service)"; rc=$?
 assert_rc "disable: unit отключён - успех" 0 "$rc"
 
 t_section "txn_rollback: systemd недоступен при наличии stop"
-printf 'userdel\txray\t\nstop\txray.service\t\n' >"$RJ"
+printf '%s\nrestore\t/var/lib/mifa-vpn-basic/manifest\t/var/backups/mifa-vpn-basic/install-1/var/lib/mifa-vpn-basic/manifest\nstop\txray.service\t\n' "$JOURNAL_V2_HEADER" >"$RJ"
 out="$(run_mock_nosystemd txn_rollback "$RJ")"; rc=$?
 assert_rc "systemd недоступен: код 3" 3 "$rc"
 assert_contains "systemd недоступен: сообщение" "$out" "systemd недоступен"
@@ -327,7 +327,7 @@ assert_contains "systemd недоступен: файлы не тронуты" "
 assert_true "systemd недоступен: журнал сохранён" test -e "$RJ"
 
 t_section "txn_rollback: фаза сервиса до файловых операций"
-printf 'userdel\txray\t\nstop\txray.service\t\n' >"$RJ"
+printf '%s\nrestore\t/var/lib/mifa-vpn-basic/manifest\t/var/backups/mifa-vpn-basic/install-1/var/lib/mifa-vpn-basic/manifest\nstop\txray.service\t\n' "$JOURNAL_V2_HEADER" >"$RJ"
 make_mocks active enabled loaded
 out="$(run_mock txn_rollback "$RJ")"; rc=$?
 assert_rc "stop не подтверждён: код 3" 3 "$rc"

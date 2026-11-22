@@ -13,6 +13,16 @@ VERSIONS = ["22.04", "24.04", "26.04"]
 P14_CONTROLS = ["control-remove", "control-restore", "staging-file", "staging-symlink",
                 "staging-directory", "destination-directory"]
 P14_NEGATIVE = ["repeat-remove", "parent-chmeta", "enable-without-stop"]
+V3_SMOKE = [
+    "control-remove", "control-restore",
+    "repeat-remove", "repeat-rmdir", "repeat-chmeta", "repeat-userdel",
+    "v3-remove-created-kill", "v3-remove-after-replaced",
+    "v3-rmdir-copied-generation", "v3-chmeta-partial",
+    "v3-userdel-group-kill", "v3-userdel-copied-generation",
+    "v3-chmeta-intent-sync",
+    "restore-after-replace-interrupted", "staging-symlink",
+    "enable-without-stop",
+]
 
 
 def boolean(value):
@@ -40,6 +50,8 @@ def select(event_name, ref, event, catalog, push_profile="smoke"):
             if not restores:
                 raise ValueError("P1-4 restore regression catalog is empty")
             cases, profile = P14_CONTROLS + restores + P14_NEGATIVE, "push-p14"
+        elif push_profile == "v3-smoke":
+            cases, profile = V3_SMOKE[:], "v3-smoke"
         elif push_profile != "smoke":
             raise ValueError("Unknown push baseline profile")
     elif event_name == "workflow_dispatch":

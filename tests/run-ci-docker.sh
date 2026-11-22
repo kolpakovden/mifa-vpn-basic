@@ -16,7 +16,10 @@ command -v python3 >/dev/null || { echo 'Python 3 required for CI evidence repor
 # Refuse reuse/symlinks rather than overwriting an earlier run's evidence.
 mkdir -- "$output"
 expected=FAIL
-case "$scenario" in control-remove|control-restore|e2e) expected=PASS ;; esac
+case "$scenario" in
+  control-remove|control-restore|e2e) expected=PASS ;;
+  v3-*) expected=NOT_ESTABLISHED ;;
+esac
 printf 'Ubuntu=%s scenario=%s expected-before-fixes=%s\n' "$ubuntu" "$scenario" "$expected"
 args=("$suite" "$ubuntu")
 if [[ -n "$confirmation" ]]; then args+=("$confirmation"); fi

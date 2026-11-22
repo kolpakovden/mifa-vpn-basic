@@ -89,12 +89,22 @@ BASE=(--non-interactive --sni "$SNI" --port "$PORT" --server-address 127.0.0.1 -
 
 assert_clean_host() {
   local p
-  for p in /usr/local/bin/xray /usr/local/etc/xray /etc/systemd/system/xray.service /var/lib/mifa-vpn-basic; do
+  for p in /usr/local/bin/xray /usr/local/etc/xray /etc/systemd/system/xray.service; do
     assert_false "$1: нет $p" test -e "$p"
   done
+  # v3 retains its empty bookkeeping directory after deleting the journal.
+  if [[ -e /var/lib/mifa-vpn-basic ]]; then
+    assert_true "$1: служебный каталог пуст и не является симлинком" state_directory_empty
+  fi
   assert_false "$1: нет пользователя xray" user_exists xray
   assert_eq "$1: unit xray.service не загружен" "not-found" "$(systemctl show -p LoadState --value xray.service)"
   assert_eq "$1: порт ${PORT} свободен" "" "$(ss -Htln "sport = :${PORT}")"
+}
+state_directory_empty() {
+  local entries
+  [[ -d /var/lib/mifa-vpn-basic && ! -L /var/lib/mifa-vpn-basic ]] || return 1
+  entries="$(find /var/lib/mifa-vpn-basic -mindepth 1 -maxdepth 1 -print -quit)" || return 1
+  [[ -z "$entries" ]]
 }
 
 cval() { sed -n "s/^$1=//p" "${2:-$CLIENT_FILE}"; }
@@ -351,7 +361,7 @@ printf 'keep\n' >/usr/local/etc/xray/keep-me.txt
 out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
 assert_rc "--rollback при неполном откате: код 3" 3 "$rc"
 assert_contains "журнал сохранён" "$out" "журнал /var/lib/mifa-vpn-basic/journal.inprogress и резервные копии"
-assert_contains "каталог не пуст" "$out" "не пуст"
+assert_contains "rmdir намерение не завершено" "$out" "v3 safety refusal"
 assert_true "журнал сохранён" test -f /var/lib/mifa-vpn-basic/journal.inprogress
 assert_true "посторонний файл не удалён" test -e /usr/local/etc/xray/keep-me.txt
 assert_false "сервис не активен" systemctl is-active --quiet xray.service
@@ -361,9 +371,13 @@ assert_rc "повторный --rollback без исправления: снов
 assert_true "журнал по-прежнему сохранён" test -f /var/lib/mifa-vpn-basic/journal.inprogress
 rm -f /usr/local/etc/xray/keep-me.txt
 out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
-assert_rc "повторный --rollback после исправления: код 0" 0 "$rc"
-assert_false "журнал удалён" test -e /var/lib/mifa-vpn-basic/journal.inprogress
-assert_clean_host "после повторного --rollback"
+assert_rc "незавершённое rmdir не повторяется: код 3" 3 "$rc"
+assert_true "журнал сохранён для ручного решения" test -e /var/lib/mifa-vpn-basic/journal.inprogress
+# Known fixture only; retain the journal outside the next transaction.
+cp -a /var/lib/mifa-vpn-basic/journal.inprogress "$W/nonempty-rmdir-journal"
+rmdir -- /usr/local/etc/xray
+rm -f -- /var/lib/mifa-vpn-basic/journal.inprogress
+assert_clean_host "после ручного разрешения rmdir"
 
 t_section "Частичный restore: маркер, повтор и сохранение данных"
 install -d -m 700 /var/lib/mifa-vpn-basic
@@ -388,23 +402,26 @@ assert_eq "манифест не перезаписан повторно" "$stal
 assert_true "журнал по-прежнему сохранён" test -f /var/lib/mifa-vpn-basic/journal.inprogress
 rm -f /usr/local/etc/xray/keep-me.txt
 out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
-assert_rc "повторный откат после устранения причины: код 0" 0 "$rc"
+assert_rc "неоднозначное rmdir после устранения причины: код 3" 3 "$rc"
+assert_true "журнал не удалён после verify-only отказа" test -f /var/lib/mifa-vpn-basic/journal.inprogress
 assert_eq "манифест восстановлен байт в байт" "$stale_sha_retry" "$(sha256sum /var/lib/mifa-vpn-basic/manifest | awk '{print $1}')"
+cp -a /var/lib/mifa-vpn-basic/journal.inprogress "$W/partial-restore-journal"
+rmdir -- /usr/local/etc/xray
 rm -rf /var/lib/mifa-vpn-basic /var/backups/mifa-vpn-basic
 assert_clean_host "после очистки (частичный restore)"
 
 if [[ "${MIFA_E2E_SKIP_APT:-0}" != "1" ]]; then
-  t_section "Нет unzip и python3: установщик ставит unzip через apt"
+  t_section "Нет Python 3: journal v3 требует отказ до установки"
   if command -v unzip >/dev/null 2>&1; then
     echo "  SKIP  unzip уже установлен"
   else
     mv /usr/bin/python3 /usr/bin/python3.mifa-masked
     out="$(bash "$INSTALL_SH" "${BASE[@]}" "${SRC[@]}" 2>&1)"; rc=$?
     mv -f /usr/bin/python3.mifa-masked /usr/bin/python3
-    assert_rc "установка с apt-get install unzip: код 0" 0 "$rc"
-    assert_contains "unzip установлен" "$out" "Пакет unzip установлен"
-    bash "$UNINSTALL_SH" --yes >/dev/null 2>&1
-    assert_clean_host "после удаления"
+    assert_rc "установка без python3 отклонена: код 1" 1 "$rc"
+    assert_contains "объяснена зависимость journal v3" "$out" "python3"
+    assert_not_contains "apt не выполнялся после отказа" "$out" "Пакет unzip установлен"
+    assert_clean_host "после отказа без python3"
   fi
 fi
 

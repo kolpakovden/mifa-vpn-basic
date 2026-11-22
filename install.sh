@@ -34,6 +34,7 @@ readonly BACKUP_ROOT="/var/backups/mifa-vpn-basic"
 # Откат не выполнен полностью: журнал сохранён, нужна повторная попытка.
 readonly RC_ROLLBACK_INCOMPLETE=3
 readonly JOURNAL_V2_HEADER='# MIFA VPN Basic journal v2'
+readonly JOURNAL_V3_HEADER='# MIFA VPN Basic journal v3'
 
 readonly DEFAULT_PORT="8443"
 readonly FINGERPRINT="chrome"
@@ -573,13 +574,13 @@ pf_check_commands() {
   local c
   local -a missing=()
   for c in curl openssl sha256sum base64 systemctl ss getent install mktemp timeout cmp readlink \
-           awk sed grep sort cut tr id useradd userdel runuser flock df findmnt uname stat; do
+           awk sed grep sort cut tr id groupadd useradd userdel runuser flock df findmnt uname stat python3; do
     if ! command -v "$c" >/dev/null 2>&1; then
       missing+=("$c")
     fi
   done
   if (( ${#missing[@]} )); then
-    pf_fail "нет команд: ${missing[*]} (Ubuntu: sudo apt-get install -y curl openssl ca-certificates iproute2 util-linux passwd)"
+    pf_fail "нет команд: ${missing[*]} (Ubuntu: sudo apt-get install -y curl openssl ca-certificates iproute2 util-linux passwd python3)"
   else
     pf_ok "необходимые команды доступны"
   fi
@@ -1144,6 +1145,441 @@ redact_config() {
 }
 
 # --- Транзакция и откат -----------------------------------------------------
+# v3 ownership evidence. Standard Python only, executed in isolated mode; no
+# installed helper binary. Files/dirs carry a random generation xattr AND a
+# dev/inode witness plus expected metadata/content. Copying a token alone or
+# reusing an inode/UID is insufficient. This does not defend against malicious
+# root copying/reconstructing all evidence or concurrent root account changes.
+txn_v3_python() {
+  python3 -I - "$@" <<'V3PY'
+import errno, hashlib, json, os, posixpath, re, secrets, stat, sys
+
+HEADER = "# MIFA VPN Basic journal v3"
+KINDS = {"remove", "rmdir", "chmeta", "userdel"}
+HEX = re.compile(r"[0-9a-f]{32}\Z")
+KEY = "user.mifa.rollback."
+
+class Refuse(Exception):
+    pass
+
+def require(ok, message):
+    if not ok:
+        raise Refuse(message)
+
+def emit(value):
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+def fault(point):
+    if os.environ.get("MIFA_BASIC_TEST_MODE") == "1" and os.environ.get("MIFA_BASIC_TEST_FAIL_AT") == point + ":kill":
+        print("MIFA_V3_KILL\t" + point, file=sys.stderr, flush=True)
+        os.kill(os.getppid(), 9); os.kill(os.getpid(), 9)
+
+def decode(value):
+    def unique(pairs):
+        result = {}
+        for k, v in pairs:
+            require(k not in result, "duplicate JSON key")
+            result[k] = v
+        return result
+    try:
+        return json.loads(value, object_pairs_hook=unique)
+    except (ValueError, TypeError) as error:
+        raise Refuse("invalid JSON: " + str(error))
+
+def parents(path):
+    require(path.startswith("/") and posixpath.normpath(path) == path and "//" not in path,
+            "non-canonical path")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.split("/")[1:-1]:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+            s = os.fstat(fd)
+            require(s.st_uid == 0 and not s.st_mode & 0o022, "untrusted parent directory")
+        return fd, os.path.basename(path)
+    except BaseException:
+        os.close(fd)
+        raise
+
+def opened(path):
+    parent, leaf = parents(path)
+    try:
+        fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        return parent, leaf, fd
+    except BaseException:
+        os.close(parent)
+        raise
+
+def attrs(fd, omit=None):
+    return {k: os.getxattr(fd, k).hex() for k in sorted(os.listxattr(fd)) if k != omit}
+
+def snapshot(fd, token, directory):
+    s = os.fstat(fd)
+    require(stat.S_ISDIR(s.st_mode) if directory else stat.S_ISREG(s.st_mode), "wrong object type")
+    result = {"dev": s.st_dev, "ino": s.st_ino, "mode": stat.S_IMODE(s.st_mode),
+              "uid": s.st_uid, "gid": s.st_gid, "attrs": attrs(fd, KEY + token)}
+    if not directory:
+        os.lseek(fd, 0, 0)
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        result.update(size=s.st_size, mtime_ns=s.st_mtime_ns, sha256=digest.hexdigest())
+    return result
+
+def account(spec, witness=None):
+    import pwd, grp
+    name = spec["path"]
+    def row(file, key):
+        s = os.lstat(file)
+        require(stat.S_ISREG(s.st_mode) and s.st_uid == 0 and not s.st_mode & 0o022,
+                "untrusted account database")
+        with open(file, encoding="utf-8") as stream:
+            rows = [l.rstrip("\n") for l in stream if l.split(":", 1)[0] == key]
+        require(len(rows) <= 1, "duplicate local account/group")
+        return rows[0] if rows else None
+    user = row("/etc/passwd", name)
+    if user is None:
+        try: pwd.getpwnam(name)
+        except KeyError: pass
+        else: raise Refuse("NSS account exists without local ownership evidence")
+        require(row("/etc/shadow", name) is None, "orphan shadow entry after account removal")
+        require(not spec["group_created"] or row("/etc/group", name) is None,
+                "account absent but its group still exists")
+        if spec["group_created"]:
+            require(row("/etc/gshadow", name) is None, "orphan gshadow entry after group removal")
+            try: grp.getgrnam(name)
+            except KeyError: pass
+            else: raise Refuse("NSS group exists after account removal")
+        for file in ("/etc/subuid", "/etc/subgid"):
+            if os.path.lexists(file):
+                require(row(file, name) is None, "orphan subordinate ID allocation")
+                if witness is not None:
+                    require(row(file, witness["passwd"].split(":")[2]) is None,
+                            "numeric subordinate ID allocation after account removal")
+        return None
+    fields = user.split(":")
+    require(len(fields) == 7 and int(fields[2]) != 0, "invalid/root account")
+    require(fields[4] == "Xray (MIFA VPN Basic tx=" + spec["token"] + ")", "account generation changed")
+    require(list(pwd.getpwnam(name)) == [fields[0], fields[1], int(fields[2]), int(fields[3]), *fields[4:]],
+            "NSS/local account disagreement")
+    with open("/etc/passwd", encoding="utf-8") as stream:
+        require(sum(l.split(":")[2] == fields[2] for l in stream if l.count(":") >= 2) == 1,
+                "UID is shared")
+    shadow = row("/etc/shadow", name)
+    require(shadow is not None, "missing shadow entry")
+    primary = grp.getgrgid(int(fields[3])).gr_name
+    local_group = row("/etc/group", name)
+    require(primary == name and local_group is not None and local_group.split(":")[2] == fields[3],
+            "private primary group changed")
+    private_shadow = row("/etc/gshadow", name)
+    require(private_shadow is not None and private_shadow.split(":")[1] == "!mifa-tx-" + spec["token"],
+            "private group generation changed")
+    groups = []
+    with open("/etc/group", encoding="utf-8") as stream:
+        for line in stream:
+            parts = line.rstrip("\n").split(":")
+            if len(parts) == 4 and (name in parts[3].split(",") or parts[0] == primary):
+                groups.append([line.rstrip("\n"), row("/etc/gshadow", parts[0])])
+    subids = []
+    for file in ("/etc/subuid", "/etc/subgid"):
+        if os.path.lexists(file):
+            by_name, by_uid = row(file, name), row(file, fields[2])
+            require(by_name is None and by_uid is None, "subordinate ID allocation is not owned by this system-user transaction")
+            subids.append([file, by_name, by_uid])
+    # No password hashes/secrets are copied into the journal.
+    return {"passwd": user, "shadow_sha256": hashlib.sha256(shadow.encode()).hexdigest(),
+            "groups_sha256": hashlib.sha256(json.dumps(sorted(groups)).encode()).hexdigest(),
+            "subids_sha256": hashlib.sha256(json.dumps(subids).encode()).hexdigest()}
+
+def evidence_shape(value, kind):
+    require(isinstance(value, dict), "evidence must be an object")
+    if kind == "userdel":
+        require(set(value) == {"passwd", "shadow_sha256", "groups_sha256", "subids_sha256"}, "bad account evidence")
+        require(all(isinstance(v, str) for v in value.values()) and value["passwd"].count(":") == 6,
+                "bad passwd evidence")
+        require(all(re.fullmatch(r"[0-9a-f]{64}", value[k]) for k in ("shadow_sha256", "groups_sha256", "subids_sha256")), "bad account digest")
+        return
+    expected = {"dev", "ino", "mode", "uid", "gid", "attrs"}
+    if kind == "remove": expected |= {"size", "mtime_ns", "sha256"}
+    require(set(value) == expected, "bad filesystem evidence fields")
+    for k in expected - {"attrs", "sha256"}:
+        require(type(value[k]) is int and value[k] >= 0, "bad evidence integer")
+    require(value["mode"] <= 0o7777 and isinstance(value["attrs"], dict), "bad evidence metadata")
+    require(all(isinstance(k, str) and isinstance(v, str) and re.fullmatch(r"(?:[0-9a-f]{2})*", v)
+                for k, v in value["attrs"].items()), "bad xattr evidence")
+    if kind == "remove":
+        require(isinstance(value["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]), "bad content digest")
+
+def validate(path):
+    with open(path, "rb") as stream:
+        raw = stream.read()
+    require(b"\0" not in raw and raw.endswith(b"\n"), "truncated/binary journal")
+    lines = raw.decode("utf-8").splitlines()
+    require(lines[0] == HEADER, "not journal v3")
+    require(len(lines) >= 2 and lines[1] in ("state\t/var/lib/mifa-vpn-basic\tcreated",
+                                            "state\t/var/lib/mifa-vpn-basic\texisting"), "missing state declaration")
+    operations, paths, restores, normalized = {}, {}, set(), [lines[1]]
+    recovery = False
+    for line in lines[2:]:
+        if not line or line.startswith("#"):
+            require(not line.startswith("# MIFA VPN Basic journal"), "duplicate version")
+            continue
+        fields = line.split("\t")
+        require(len(fields) == 3 and "\r" not in line, "bad field count")
+        action, key, arg = fields
+        if action == "prepare":
+            require(not recovery and HEX.fullmatch(key) and key not in operations, "duplicate/late preparation")
+            spec = decode(arg)
+            require(isinstance(spec, dict), "preparation must be an object")
+            require(set(spec) == {"kind", "path", "token", "before", "target", "group_created"}, "bad preparation schema")
+            kind, target, token = spec["kind"], spec["path"], spec["token"]
+            require(isinstance(kind, str) and kind in KINDS and isinstance(target, str) and
+                    isinstance(token, str) and HEX.fullmatch(token), "bad operation")
+            require(not any(c in target for c in "\0\t\r\n") and target not in paths and target not in restores, "duplicate/invalid target")
+            require(target == "xray" if kind == "userdel" else
+                    target.startswith("/") and posixpath.normpath(target) == target and "//" not in target,
+                    "invalid operation path")
+            require(kind == "chmeta" and isinstance(spec["before"], dict) and isinstance(spec["target"], dict)
+                    or kind != "chmeta" and spec["before"] is None and spec["target"] is None, "bad metadata intent")
+            require(isinstance(spec["group_created"], bool), "bad group intent")
+            require(spec["group_created"] == (kind == "userdel"), "v3 requires a private transaction-created group")
+            if kind == "chmeta":
+                evidence_shape(spec["before"], kind)
+                target_meta = spec["target"]
+                require(set(target_meta) == {"mode", "uid", "gid"} and
+                        all(type(v) is int and v >= 0 for v in target_meta.values()) and
+                        target_meta["mode"] <= 0o7777, "bad desired metadata")
+            operations[key] = {"spec": spec, "phase": "prepared", "witness": None}
+            paths[target] = key
+            normalized.append("owned-" + kind + "\t" + target + "\t" + key)
+        elif action == "ready":
+            require(not recovery and key in operations and operations[key]["phase"] == "prepared", "bad readiness")
+            witness = decode(arg)
+            evidence_shape(witness, operations[key]["spec"]["kind"])
+            if operations[key]["spec"]["kind"] == "chmeta":
+                spec = operations[key]["spec"]
+                require(all(witness[k] == spec["before"][k] for k in ("dev", "ino")) and
+                        all(witness[k] == v for k, v in spec["target"].items()), "inconsistent metadata evidence")
+            if operations[key]["spec"]["kind"] == "userdel":
+                parts = witness["passwd"].split(":")
+                require(parts[0] == "xray" and parts[2].isdigit() and int(parts[2]) != 0 and
+                        parts[4] == "Xray (MIFA VPN Basic tx=" + operations[key]["spec"]["token"] + ")", "bad account generation")
+            operations[key].update(phase="ready", witness=witness)
+        elif action in ("undoing", "undone", "cancelled"):
+            recovery = True
+            require(key in operations and arg == "", "unknown undo ID")
+            op = operations[key]
+            expected = {"undoing": "ready", "undone": "undoing", "cancelled": "prepared"}[action]
+            require(op["phase"] == expected, "invalid undo transition")
+            op["phase"] = action
+        else:
+            require(action in ("stop", "disable", "restore", "restoring", "restored"), "legacy/unknown v3 action")
+            if action in ("restoring", "restored"):
+                recovery = True
+            else:
+                require(not recovery, "late installation record")
+            require(key not in paths, "conflicting restore/owned path")
+            if action == "restore": restores.add(key)
+            normalized.append(line)
+    return operations, normalized
+
+def main():
+    cmd, *a = sys.argv[1:]
+    if cmd == "id":
+        print(secrets.token_hex(16)); return
+    if cmd == "validate":
+        _, rows = validate(a[0]); print("\n".join(rows)); return
+    if cmd == "spec":
+        import pwd, grp
+        opid, kind, path, mode, owner, group, token = a
+        require(HEX.fullmatch(opid) and HEX.fullmatch(token), "bad generation")
+        spec = dict(kind=kind, path=path, token=token, before=None, target=None, group_created=False)
+        if kind == "userdel":
+            require(path == "xray", "invalid user")
+            try: pwd.getpwnam(path)
+            except KeyError: pass
+            else: raise Refuse("account already exists")
+            try: grp.getgrnam(path)
+            except KeyError: pass
+            else: raise Refuse("pre-existing group is not owned by this transaction")
+            spec["group_created"] = True
+        elif kind == "chmeta":
+            p, _, fd = opened(path)
+            try:
+                spec["before"] = snapshot(fd, token, True)
+                spec["target"] = dict(mode=int(mode, 8), uid=pwd.getpwnam(owner).pw_uid,
+                                      gid=grp.getgrnam(group).gr_gid)
+            finally: os.close(fd); os.close(p)
+        emit(spec); return
+    ops, _ = validate(a[0]); opid = a[1]
+    require(opid in ops, "unknown operation")
+    op = ops[opid]; spec = op["spec"]; kind = spec["kind"]; path = spec["path"]
+    if cmd == "status":
+        print(op["phase"] + "\t" + kind + "\t" + path); return
+    if kind == "userdel":
+        current = account(spec, op["witness"])
+        if cmd == "witness":
+            require(current is not None, "account missing before ready"); emit(current); return
+        if cmd in ("absent", "outcome"):
+            require(current is None, "account/group exists after deletion"); return
+        if cmd == "check":
+            require(current is not None and current == op["witness"], "account changed"); return
+        raise Refuse("unsupported account operation")
+    try:
+        p, leaf = parents(path)
+    except FileNotFoundError:
+        if cmd in ("absent", "outcome") and kind != "chmeta": return
+        raise Refuse("parent absent")
+    fd = None
+    try:
+        if cmd in ("create-dir", "create-file"):
+            import pwd, grp
+            require(op["phase"] == "prepared", "creation without preparation")
+            mode, uid, gid = int(a[3], 8), pwd.getpwnam(a[4]).pw_uid, grp.getgrnam(a[5]).gr_gid
+            if cmd == "create-dir":
+                os.mkdir(leaf, 0o700, dir_fd=p)
+                fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=p)
+            else:
+                fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=p)
+                with open(a[2], "rb") as source:
+                    while True:
+                        block = source.read(1024 * 1024)
+                        if not block: break
+                        view = memoryview(block)
+                        while view: view = view[os.write(fd, view):]
+            fault("v3_created_without_generation")
+            os.setxattr(fd, KEY + spec["token"], spec["token"].encode(), os.XATTR_CREATE)
+            os.fchown(fd, uid, gid); os.fchmod(fd, mode)
+            os.fsync(fd); os.fsync(p); return
+        try:
+            candidate = os.stat(leaf, dir_fd=p, follow_symlinks=False)
+            require(stat.S_ISREG(candidate.st_mode) if kind == "remove" else stat.S_ISDIR(candidate.st_mode),
+                    "wrong target type")
+            fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=p)
+        except FileNotFoundError:
+            if cmd in ("absent", "outcome") and kind != "chmeta": return
+            raise Refuse("target missing")
+        if cmd == "absent": sys.exit(1)
+        token = spec["token"]; directory = kind != "remove"
+        if cmd == "tag":
+            require(op["phase"] == "prepared", "not preparing")
+            if kind == "chmeta":
+                require(snapshot(fd, token, True) == spec["before"], "directory changed before metadata apply")
+            os.setxattr(fd, KEY + token, token.encode(), os.XATTR_CREATE)
+            if kind == "chmeta":
+                target = spec["target"]
+                os.fchown(fd, target["uid"], target["gid"])
+                os.fchmod(fd, target["mode"])
+            os.fsync(fd); os.fsync(p); return
+        current = snapshot(fd, token, directory)
+        require(os.getxattr(fd, KEY + token) == token.encode(), "generation marker absent/changed")
+        if cmd == "witness":
+            if kind == "chmeta":
+                require((current["dev"], current["ino"]) == (spec["before"]["dev"], spec["before"]["ino"]), "object replaced")
+                require(all(current[k] == v for k, v in spec["target"].items()), "metadata application incomplete")
+            emit(current); return
+        if cmd == "outcome":
+            require(kind == "chmeta" and current == spec["before"], "undo result changed")
+            return
+        require(cmd in ("check", "mutate") and current == op["witness"], "object changed since installation")
+        if cmd == "check": return
+        require(op["phase"] == "undoing", "missing durable undo intent")
+        # p and fd are pinned and symlinks are not followed. Compare directory
+        # entry again before unlink/rmdir. Concurrent malicious root is excluded.
+        s = os.stat(leaf, dir_fd=p, follow_symlinks=False)
+        require((s.st_dev, s.st_ino) == (current["dev"], current["ino"]), "entry replaced")
+        if kind == "remove": os.unlink(leaf, dir_fd=p)
+        elif kind == "rmdir": os.rmdir(leaf, dir_fd=p)
+        else:
+            old = spec["before"]
+            os.fchown(fd, old["uid"], old["gid"])
+            fault("v3_chmeta_partial")
+            os.fchmod(fd, old["mode"])
+        os.fsync(fd); os.fsync(p)
+    finally:
+        if fd is not None: os.close(fd)
+        os.close(p)
+
+try:
+    main()
+except (Refuse, KeyError) as error:
+    print("v3 safety refusal: " + str(error), file=sys.stderr); sys.exit(1)
+except OSError as error:
+    if error.errno in (errno.ENOENT, errno.ELOOP, errno.ENOTDIR, errno.ENODATA,
+                       errno.ENOTEMPTY, errno.EEXIST, errno.EACCES, errno.EPERM):
+        print("v3 safety refusal: " + str(error), file=sys.stderr); sys.exit(1)
+    print("MIFA_V3_INFRA_ERROR\t2", file=sys.stderr)
+    print("v3 evidence I/O error: " + str(error), file=sys.stderr); sys.exit(2)
+except Exception as error:
+    print("MIFA_V3_INFRA_ERROR\t2", file=sys.stderr)
+    print("v3 evidence error: " + str(error), file=sys.stderr); sys.exit(2)
+V3PY
+}
+
+txn_v3_prepare() {
+  local kind="$1" path="$2" mode="${3:-}" owner="${4:-root}" group="${5:-root}" generation="${6:-}"
+  V3_ID="$(txn_v3_python id)" || return 1
+  [[ -n "$generation" ]] || generation="$V3_ID"
+  local spec
+  spec="$(txn_v3_python spec "$V3_ID" "$kind" "$path" "$mode" "$owner" "$group" "$generation")" || return 1
+  journal_append "$JOURNAL" prepare "$V3_ID" "$spec" || return 1
+  test_fault v3_after_prepare
+}
+
+txn_v3_ready() {
+  local witness
+  test_fault v3_before_ready
+  witness="$(txn_v3_python witness "$JOURNAL" "$1")" || return 1
+  journal_append "$JOURNAL" ready "$1" "$witness" || return 1
+}
+
+txn_v3_undo() {
+  local journal="$1" id="$2" phase kind path absent_rc=0
+  IFS=$'\t' read -r phase kind path <<<"$(txn_v3_python status "$journal" "$id")"
+  [[ -n "$phase" ]] || return 1
+  case "$phase" in
+    prepared|cancelled)
+      txn_v3_python absent "$journal" "$id" || return 1
+      if [[ "$phase" == prepared ]]; then journal_append "$journal" cancelled "$id" '' || return 1; fi
+      return 0 ;;
+    undoing|undone)
+      txn_v3_python outcome "$journal" "$id" || return 1
+      if [[ "$phase" == undoing ]]; then journal_append "$journal" undone "$id" '' || return 1; fi
+      return 0 ;;
+    ready) ;;
+    *) return 1 ;;
+  esac
+  # Absence is safe to acknowledge without issuing another delete.
+  if [[ "$kind" != chmeta ]]; then
+    txn_v3_python absent "$journal" "$id" || absent_rc=$?
+    case "$absent_rc" in
+      0)
+        journal_append "$journal" undoing "$id" '' && journal_append "$journal" undone "$id" ''
+        return $? ;;
+      1) ;; # Present: an independent full witness check is required below.
+      *) return 1 ;; # Do not discard an infrastructure error as mere presence.
+    esac
+  fi
+  txn_v3_python check "$journal" "$id" || return 1
+  journal_append "$journal" undoing "$id" '' || return 1
+  test_fault "v3_${kind}_before"
+  if [[ "$kind" == userdel ]]; then
+    txn_v3_python check "$journal" "$id" || return 1
+    userdel "$path" || return 1
+    sync /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc 2>/dev/null || return 1
+  else
+    txn_v3_python mutate "$journal" "$id" || return 1
+  fi
+  test_fault "v3_${kind}_after"
+  txn_v3_python outcome "$journal" "$id" || return 1
+  test_fault "v3_${kind}_before_done"
+  journal_append "$journal" undone "$id" ''
+}
+
 journal_undo() {
   journal_append "$JOURNAL" "$1" "${2:-}" "${3:-}"
 }
@@ -1171,17 +1607,18 @@ test_fault() {
 
 txn_begin() {
   local created=0
+  command -v python3 >/dev/null 2>&1 || { err 'Journal v3 требует python3'; return 1; }
+  [[ ! -L "$STATE_DIR" && ( ! -e "$STATE_DIR" || -d "$STATE_DIR" ) ]] || return 1
+  [[ ! -e "$JOURNAL" && ! -L "$JOURNAL" ]] || return 1
   if [[ ! -d "$STATE_DIR" ]]; then
     created=1
   fi
   install -d -m 0700 -o root -g root "$STATE_DIR"
   : >"$JOURNAL"
   chmod 0600 "$JOURNAL"
-  printf '%s\n' "$JOURNAL_V2_HEADER" >>"$JOURNAL" || return 1
+  printf '%s\n' "$JOURNAL_V3_HEADER" >>"$JOURNAL" || return 1
+  journal_append "$JOURNAL" state "$STATE_DIR" "$([[ "$created" == 1 ]] && echo created || echo existing)" || return 1
   sync "$JOURNAL" "$STATE_DIR" 2>/dev/null || return 1
-  if (( created )); then
-    journal_undo rmdir "$STATE_DIR" || return 1
-  fi
   BACKUP_DIR="${BACKUP_ROOT}/install-$(date -u +%Y%m%dT%H%M%SZ)"
   TXN_ACTIVE=1
 }
@@ -1197,40 +1634,50 @@ backup_path() {
 }
 
 txn_mkdir() {
-  local dir="$1" mode="$2" owner="$3" group="$4" parent
+  local dir="$1" mode="$2" owner="$3" group="$4" parent id
   parent="$(dirname "$dir")"
   if [[ ! -d "$parent" ]]; then
-    txn_mkdir "$parent" 0755 root root
+    txn_mkdir "$parent" 0755 root root || return 1
   fi
   if [[ -d "$dir" ]]; then
-    journal_undo chmeta "$dir" "$(stat -c '%a:%u:%g' "$dir")" || return 1
+    txn_v3_prepare chmeta "$dir" "$mode" "$owner" "$group" || return 1
+    id="$V3_ID"
+    txn_v3_python tag "$JOURNAL" "$id" || return 1
   elif [[ -e "$dir" || -L "$dir" ]]; then
     die "${dir} существует и не является каталогом"
   else
-    journal_undo rmdir "$dir" || return 1
+    txn_v3_prepare rmdir "$dir" || return 1
+    id="$V3_ID"
+    txn_v3_python create-dir "$JOURNAL" "$id" '' "$mode" "$owner" "$group" || return 1
   fi
-  install -d -m "$mode" -o "$owner" -g "$group" "$dir"
+  txn_v3_ready "$id"
 }
 
 txn_install_file() {
-  local src="$1" dest="$2" mode="$3" owner="$4" group="$5" tmp
+  local src="$1" dest="$2" mode="$3" owner="$4" group="$5" tmp dest_id='' tmp_id generation
   if [[ ! -d "$(dirname "$dest")" ]]; then
-    txn_mkdir "$(dirname "$dest")" 0755 root root
+    txn_mkdir "$(dirname "$dest")" 0755 root root || return 1
   fi
   if [[ -e "$dest" || -L "$dest" ]]; then
     backup_path "$dest"
     journal_undo restore "$dest" "$BACKUP_PATH" || return 1
   else
-    journal_undo remove "$dest" || return 1
+    txn_v3_prepare remove "$dest" || return 1
+    dest_id="$V3_ID"
   fi
-  tmp="${dest}.mifa-new.$$"
-  journal_undo remove "$tmp" || return 1
-  install -m "$mode" -o "$owner" -g "$group" -- "$src" "$tmp"
-  mv -f -- "$tmp" "$dest"
+  generation="${dest_id:-$(txn_v3_python id)}" || return 1
+  tmp="${dest}.mifa-new.$generation"
+  txn_v3_prepare remove "$tmp" '' root root "$generation" || return 1
+  tmp_id="$V3_ID"
+  txn_v3_python create-file "$JOURNAL" "$tmp_id" "$src" "$mode" "$owner" "$group" || return 1
+  txn_v3_ready "$tmp_id" || return 1
+  mv -fT -- "$tmp" "$dest" || return 1
+  sync "$dest" "$(dirname "$dest")" 2>/dev/null || return 1
+  if [[ -n "$dest_id" ]]; then txn_v3_ready "$dest_id" || return 1; fi
 }
 
 txn_create_user() {
-  local uid
+  local uid id
   if id -u "$XRAY_USER" >/dev/null 2>&1; then
     uid="$(id -u "$XRAY_USER")"
     [[ "$uid" != "0" ]] || die "Пользователь ${XRAY_USER} имеет UID 0: установка остановлена"
@@ -1238,14 +1685,17 @@ txn_create_user() {
     USER_CREATED=0
     return 0
   fi
-  journal_undo userdel "$XRAY_USER" || return 1
-  if getent group "$XRAY_USER" >/dev/null 2>&1; then
-    useradd --system --gid "$XRAY_USER" --no-create-home --home-dir /nonexistent \
-            --shell /usr/sbin/nologin --comment "Xray (MIFA VPN Basic)" "$XRAY_USER"
-  else
-    useradd --system --user-group --no-create-home --home-dir /nonexistent \
-            --shell /usr/sbin/nologin --comment "Xray (MIFA VPN Basic)" "$XRAY_USER"
-  fi
+  txn_v3_prepare userdel "$XRAY_USER" || return 1
+  id="$V3_ID"
+  # userdel can delete the private group too. A locked, non-password generation
+  # is assigned at group creation, never by adopting a pre-existing group.
+  groupadd --system --password "!mifa-tx-$id" "$XRAY_USER" || return 1
+  sync /etc/group /etc/gshadow /etc 2>/dev/null || return 1
+  test_fault v3_userdel_group_created
+  useradd --system --gid "$XRAY_USER" --no-user-group --no-create-home --home-dir /nonexistent \
+          --shell /usr/sbin/nologin --comment "Xray (MIFA VPN Basic tx=$id)" "$XRAY_USER" || return 1
+  sync /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc 2>/dev/null || return 1
+  txn_v3_ready "$id" || return 1
   USER_CREATED=1
   ok "Создан системный пользователь ${XRAY_USER}"
 }
@@ -1314,7 +1764,7 @@ journal_mark_restored() {
 # Parse the entire immutable input snapshot BEFORE systemd/filesystem actions.
 # These globals describe validated records only; v1 is never upgraded implicitly.
 journal_validate() {
-  local journal="$1" line action a1 a2 rest i recovery=0 base
+  local journal="$1" line action a1 a2 rest i recovery=0 base normalized
   local -a lines=()
   local -A used_backups=() other_paths=()
   RB_JOURNAL_VERSION=1
@@ -1327,6 +1777,11 @@ journal_validate() {
     cmp -s -- "$journal" <(printf '%s\n' "${lines[@]}") || return 1
   fi
   if [[ "${lines[0]:-}" == "$JOURNAL_V2_HEADER" ]]; then RB_JOURNAL_VERSION=2; fi
+  if [[ "${lines[0]:-}" == "$JOURNAL_V3_HEADER" ]]; then
+    RB_JOURNAL_VERSION=3
+    normalized="$(txn_v3_python validate "$journal")" || return 1
+    mapfile -t lines <<<"$normalized"
+  fi
   for ((i=0; i<${#lines[@]}; i++)); do
     line="${lines[i]}"
     if [[ "$line" == '# MIFA VPN Basic journal'* ]]; then
@@ -1338,12 +1793,24 @@ journal_validate() {
     action="${line%%$'\t'*}"; rest="${line#*$'\t'}"
     a1="${rest%%$'\t'*}"; a2="${rest#*$'\t'}"
     [[ -n "$a1" && "$a2" != *$'\t'* ]] || return 1
+    if [[ "$action" == state ]]; then
+      [[ "$RB_JOURNAL_VERSION" == 3 && "$a1" == "$STATE_DIR" && ( "$a2" == created || "$a2" == existing ) ]] || return 1
+      RB_JOURNAL_ENTRIES+=("$line")
+      continue
+    fi
+    if [[ "$action" == owned-* ]]; then
+      [[ "$RB_JOURNAL_VERSION" == 3 && "$a2" =~ ^[0-9a-f]{32}$ ]] || return 1
+      journal_entry_allowed "${action#owned-}" "$a1" '' || return 1
+      [[ -z "${RB_RESTORE_BACKUP[$a1]:-}" ]] || return 1
+      other_paths["$a1"]=1
+      RB_JOURNAL_ENTRIES+=("$line")
+      continue
+    fi
     journal_entry_allowed "$action" "$a1" "$a2" || return 1
     case "$action" in
-      remove|rmdir|chmeta)
-        [[ -z "${RB_RESTORE_BACKUP[$a1]:-}" ]] || return 1
-        other_paths["$a1"]=1
-        ;;
+      remove|rmdir|chmeta|userdel)
+        warn "v1/v2 undo без свидетельства принадлежности: ${action} ${a1}"
+        return 1 ;;
     esac
     case "$action" in
       restore)
@@ -1361,10 +1828,10 @@ journal_validate() {
         recovery=1
         [[ "${RB_RESTORE_BACKUP[$a1]:-}" == "$a2" ]] || return 1
         if [[ "$action" == restoring ]]; then
-          [[ "$RB_JOURNAL_VERSION" == 2 && "${RB_RESTORE_PHASE[$a1]}" == pending ]] || return 1
+          [[ "$RB_JOURNAL_VERSION" != 1 && "${RB_RESTORE_PHASE[$a1]}" == pending ]] || return 1
           RB_RESTORE_PHASE["$a1"]=restoring
         else
-          if [[ "$RB_JOURNAL_VERSION" == 2 ]]; then
+          if [[ "$RB_JOURNAL_VERSION" != 1 ]]; then
             [[ "${RB_RESTORE_PHASE[$a1]}" == restoring ]] || return 1
           else
             [[ "${RB_RESTORE_PHASE[$a1]}" == pending ]] || return 1
@@ -1372,10 +1839,6 @@ journal_validate() {
           RB_RESTORE_PHASE["$a1"]=restored
         fi
         continue
-        ;;
-      chmeta)
-        (( recovery == 0 )) || return 1
-        [[ "$a2" =~ ^[0-7]{3,4}:[0-9]+:[0-9]+$ ]] || return 1
         ;;
       *) (( recovery == 0 )) && [[ -z "$a2" ]] || return 1 ;;
     esac
@@ -1418,7 +1881,7 @@ txn_restore_types_safe() {
 # Independent of cp/mv's exit status. Compare bytes, type, permissions, owner,
 # nanosecond mtime and all readable xattrs (including ACLs). Open final files
 # without following symlinks; uncertainty or unavailable Python fails closed.
-# Python is optional elsewhere in this installer; restore requires it explicitly.
+# v1/v2 recovery also requires Python explicitly for independent verification.
 txn_restore_matches() {
   local verifier_rc=0
   if ! command -v python3 >/dev/null 2>&1; then
@@ -1483,7 +1946,7 @@ txn_restore_file() (
     info "Уже восстановлен ${dest}: содержимое и метаданные совпадают с ${backup}"
     return 0
   fi
-  [[ "$phase" == pending && "$RB_JOURNAL_VERSION" == 2 ]] || return 1
+  [[ "$phase" == pending && "$RB_JOURNAL_VERSION" != 1 ]] || return 1
   command -v python3 >/dev/null 2>&1 || {
     warn 'Для проверки restore нужен python3'
     printf 'MIFA_RESTORE_VERIFIER_ERROR\t127\n' >&2
@@ -1563,7 +2026,7 @@ txn_disable_unit() {
 }
 
 txn_rollback() {
-  local journal="${1:-$JOURNAL}" i action a1 a2 m u g entry rmstate=0 rc=0 blocked=0 skipped=0 leftover=""
+  local journal="${1:-$JOURNAL}" i action a1 a2 entry rmstate=0 rc=0 blocked=0 skipped=0 leftover=""
   local -a entries=()
   set +e
   trap - ERR
@@ -1604,38 +2067,16 @@ txn_rollback() {
     IFS=$'\t' read -r action a1 a2 <<<"$entry"
     case "$action" in
       stop|disable|restored) continue ;;
+      state) [[ "$a2" != created ]] || rmstate=1; continue ;;
     esac
     if (( blocked )); then
       skipped=$((skipped + 1))
       continue
     fi
     case "$action" in
-      remove)
-        if [[ -e "$a1" || -L "$a1" ]]; then
-          rm -f -- "$a1" || { warn "Не удалось удалить ${a1}"; rc=1; }
-        fi
-        ;;
-      rmdir)
-        if [[ "$a1" == "$STATE_DIR" ]]; then
-          rmstate=1
-        elif [[ -d "$a1" ]]; then
-          rmdir -- "$a1" 2>/dev/null || { warn "Каталог ${a1} не пуст и оставлен"; rc=1; }
-        fi
-        ;;
-      chmeta)
-        IFS=: read -r m u g <<<"$a2"
-        if ! { chmod "$m" "$a1" && chown "${u}:${g}" "$a1"; }; then
-          warn "Не удалось восстановить права ${a1}"
-          rc=1
-        fi
-        ;;
+      owned-*) txn_v3_undo "$journal" "$a2" || rc=1 ;;
       restore)
         txn_restore_file "$journal" "$a1" "$a2" "${RB_RESTORE_PHASE[$a1]}" || rc=1
-        ;;
-      userdel)
-        if id -u "$a1" >/dev/null 2>&1; then
-          userdel "$a1" >/dev/null 2>&1 || { warn "Не удалось удалить пользователя ${a1}"; rc=1; }
-        fi
         ;;
     esac
   done
@@ -1671,8 +2112,8 @@ txn_rollback() {
     warn "Не удалось удалить журнал ${journal}: откат можно повторить"
     return "$RC_ROLLBACK_INCOMPLETE"
   fi
-  if (( rmstate )) && ! rmdir -- "$STATE_DIR" 2>/dev/null; then
-    warn "Каталог ${STATE_DIR} не пуст: удалите его вручную (docs/RECOVERY.md, раздел 6)"
+  if [[ "$RB_JOURNAL_VERSION" == 3 ]]; then
+    info "Служебный каталог ${STATE_DIR} и маркеры поколений каталогов оставлены; после удаления журнала нет обязательных мутаций"
   fi
   ok "Откат завершён: изменения установщика отменены"
   return 0

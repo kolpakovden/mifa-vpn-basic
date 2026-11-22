@@ -75,6 +75,18 @@ rmdir() { echo UNEXPECTED_MUTATION >&2; return 99; }
         result = self.execute("", 'journal_validate "$FIXTURE"; echo "$RB_JOURNAL_VERSION"\n')
         self.assertEqual(result.stdout.strip(), "1")
 
+    def test_legacy_undo_names_are_not_ownership_evidence(self):
+        for header in ("", HEADER):
+            for action, target, arg in [("remove", "/usr/local/bin/xray", ""),
+                                        ("rmdir", "/usr/local/etc/xray", ""),
+                                        ("chmeta", "/usr/local/etc/xray", "700:0:0"),
+                                        ("userdel", "xray", "")]:
+                with self.subTest(version=header, action=action):
+                    data = header + record(action, target, arg)
+                    result = self.execute(data, 'txn_rollback "$FIXTURE"; exit $?\n')
+                    self.assertEqual(result.returncode, 3)
+                    self.assertEqual(result.journal, data)
+
     def test_invalid_sequence_never_reaches_mutators(self):
         base = HEADER + record("restore")
         bad = [
