@@ -7,7 +7,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly MIFA_BASIC_VERSION="1.1.0"
+readonly MIFA_BASIC_VERSION="1.1.1"
 
 # --- Закреплённый релиз Xray ------------------------------------------------
 # Версия и SHA256 официальных архивов https://github.com/XTLS/Xray-core/releases
