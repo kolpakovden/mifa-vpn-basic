@@ -146,6 +146,20 @@ class Oracles(unittest.TestCase):
         run, observer = self.observer_fixture()
         self.assertFalse(probe.check_observer(run, observer, ["rm", "userdel"]))
 
+    def test_descriptor_operations_require_a_real_stop_barrier(self):
+        run, observer = self.observer_fixture()
+        python = self.root / "real" / "python3"
+        (observer / "python-real").write_text(str(python))
+        trace = run / "trace.124"
+        (run / "stopped").write_text("100.100000000\n")
+        for stamp, expected in [("100.200000", True), ("100.000000", False)]:
+            trace.write_text(f'100.000000 execve({json.dumps(str(python))}, ["python3"], 0x0) = 0\n'
+                             f'{stamp} fchmod(3, 0700) = 0\n')
+            self.assertEqual(probe.check_observer(run, observer, ["rm", "py-fchmod"]), expected)
+        (run / "stopped").unlink()
+        self.assertFalse(probe.check_observer(run, observer, ["rm", "py-fchmod"]))
+        self.assertFalse(probe.check_observer(run, observer, ["rm", "py-unlink"]))
+
 
 class BaselinePlan(unittest.TestCase):
     catalog = planner.SMOKE + ["repeat-rmdir", "repeat-userdel"]
@@ -223,6 +237,21 @@ class BaselinePlan(unittest.TestCase):
                            (planner.BRANCH, {"deleted": True, "head_commit": {"message": "[baseline-smoke]"}})]:
             with self.subTest(ref=ref, event=event), self.assertRaises(ValueError):
                 planner.select("push", ref, event, planner.V3_SMOKE, "v3-smoke")
+
+    @unittest.skipUnless(options.bash, "Bash unavailable")
+    def test_basic_freeze_is_small_and_uses_existing_case_runner(self):
+        catalog = subprocess.check_output([options.bash, str(TESTS / "rollback_regressions.sh"), "--list"],
+                                          text=True, encoding="utf-8", timeout=10).splitlines()
+        event = {"head_commit": {"message": "test [baseline-smoke]"}}
+        plan = planner.select("push", planner.BRANCH, event, catalog, "basic-freeze")
+        self.assertEqual(plan["scenarios"], planner.BASIC_SMOKE)
+        self.assertEqual(len(plan["scenarios"]), 20)
+        self.assertEqual(plan["versions"], ["24.04"])
+        self.assertFalse(plan["run_systemd"])
+        for name in ("parent-chmeta", "enable-without-stop", "service-stop-failure", "service-foreign-unit"):
+            self.assertIn(name, plan["scenarios"])
+        with self.assertRaises(ValueError):
+            planner.select("push", planner.BRANCH, {"head_commit": {"message": "ordinary push"}}, catalog, "basic-freeze")
 
     def test_deleted_branch_missing_head_and_pr_are_rejected(self):
         for event in [{}, {"head_commit": None},
@@ -615,7 +644,7 @@ class RunnerGuards(unittest.TestCase):
             if case.startswith("v3-"):
                 self.assertEqual(result.report["expected_before_fixes"], "NOT_ESTABLISHED")
             if case == "enable-without-stop":
-                self.assertIn("execve coverage excludes Python", result.summary)
+                self.assertIn("Python descriptor syscall timestamps", result.summary)
 
     def test_ci_report_rejects_zero_exit_without_completion_evidence(self):
         result, _, _ = self.run_runner("rollback", ci_capture=True,

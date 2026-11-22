@@ -15,7 +15,8 @@ CASES=(control-remove control-restore repeat-remove repeat-rmdir repeat-chmeta
        repeat-userdel parent-remove parent-rmdir parent-chmeta leaf-chmeta
        setup-symlink-chmeta parent-restore backup-parent-restore
        staging-file staging-symlink staging-directory destination-directory
-       enable-without-stop
+       enable-without-stop service-stop-failure service-foreign-unit
+       journal-parent-rollback backup-setup-parent
        restore-intent-interrupted restore-before-replace-interrupted
        restore-after-replace-interrupted restore-after-replace-edited
        restore-after-replace-metadata restore-after-replace-xattr
@@ -84,7 +85,9 @@ set -euo pipefail
 W="$MIFA_RB_TEST_DIR"
   printf 'systemctl %s\n' "$*" >>"$W/events"
   case "$1" in
-    stop) printf 'inactive\n' >"$W/active" ;;
+    stop)
+      [[ "${MIFA_RB_FAIL_STOP:-0}" != 1 ]] || exit 1
+      printf 'inactive\n' >"$W/active" ;;
     disable) printf 'disabled\n' >"$W/enabled" ;;
     is-active)
       cat "$W/active"
@@ -94,7 +97,9 @@ W="$MIFA_RB_TEST_DIR"
       case "$*" in
         *ActiveState*) cat "$W/active" ;;
         *UnitFileState*) cat "$W/enabled" ;;
-        *LoadState*) printf 'loaded\n' ;;
+        *LoadState*) if [[ -f /etc/systemd/system/xray.service ]]; then echo loaded; else echo not-found; fi ;;
+        *FragmentPath*) if [[ -f /etc/systemd/system/xray.service ]]; then echo /etc/systemd/system/xray.service; else echo ''; fi ;;
+        *DropInPaths*) echo '' ;;
         *) exit 2 ;;
       esac
       ;;
@@ -186,6 +191,32 @@ FAULTS
 
 t_section "$CASE"
 case "$CASE" in
+  journal-parent-rollback)
+    txn_begin
+    txn_install_file "$W/source" "$XRAY_BIN" 0755 root root
+    mv -T -- "$STATE_DIR" "$W/outside-state"
+    ln -s -- "$W/outside-state" "$STATE_DIR"
+    save_snapshot "$W/outside-state" "$W/outside-state.json"
+    save_snapshot "$XRAY_BIN" "$W/binary.json"
+    rollback
+    incomplete
+    assert_snapshot 'journal parent symlink cannot mutate outside state' "$W/outside-state.json" "$W/outside-state"
+    assert_snapshot 'journal parent refusal leaves binary untouched' "$W/binary.json" "$XRAY_BIN"
+    ;;
+  backup-setup-parent)
+    install -d -m 0700 "$STATE_DIR" "$W/outside-backup"
+    printf 'original manifest\n' >"$MANIFEST"
+    printf 'foreign backup data\n' >"$W/outside-backup/keep"
+    ln -s -- "$W/outside-backup" "$BACKUP_ROOT"
+    txn_begin
+    save_snapshot "$MANIFEST" "$W/original.json"
+    save_snapshot "$W/outside-backup" "$W/outside-backup.json"
+    if txn_install_file "$W/source" "$MANIFEST" 0600 root root; then setup_rc=0; else setup_rc=$?; fi
+    assert_rc_nonzero 'backup creation rejects parent symlink' "$setup_rc"
+    assert_snapshot 'backup setup preserves outside data' "$W/outside-backup.json" "$W/outside-backup"
+    assert_snapshot 'backup failure cannot replace original file' "$W/original.json" "$MANIFEST"
+    assert_true 'journal retained after failed setup' test -f "$JOURNAL"
+    ;;
   v3-*)
     # Sourced only AFTER all disposable-container guards and fixture setup.
     # shellcheck source=tests/rollback_v3_cases.sh
@@ -506,7 +537,7 @@ PY
     esac
     assert_snapshot 'backup retained across all attempts' "$W/backup-before.json" "$BACKUP_DIR"
     ;;
-  enable-without-stop)
+  enable-without-stop|service-stop-failure|service-foreign-unit)
     install -d -m 0700 "$XRAY_CONF_DIR"
     prepare_restore
     txn_create_user
@@ -523,9 +554,29 @@ PY
     printf 'active\n' >"$W/active"
     must test -f "$XRAY_BIN"
     if grep -q $'^stop\t' "$JOURNAL"; then echo 'Unexpected stop record' >&2; exit 2; fi
+    if [[ "$CASE" != enable-without-stop ]]; then
+      [[ "$CASE" != service-foreign-unit ]] || printf 'administrator unit\n' >"$XRAY_UNIT"
+      for target in "$XRAY_BIN" "$XRAY_UNIT" "$XRAY_CONF_DIR" "$STATE_DIR"; do
+        save_snapshot "$target" "$W/${target//\//_}.before.json"
+      done
+      for db in passwd shadow group gshadow; do save_snapshot "/etc/$db" "$W/$db.before.json"; done
+      if [[ "$CASE" == service-stop-failure ]]; then MIFA_RB_FAIL_STOP=1 rollback; else rollback; fi
+      incomplete
+      for target in "$XRAY_BIN" "$XRAY_UNIT" "$XRAY_CONF_DIR" "$STATE_DIR"; do
+        assert_snapshot 'service refusal preserves transaction files' "$W/${target//\//_}.before.json" "$target"
+      done
+      for db in passwd shadow group gshadow; do assert_snapshot "$db unchanged on service refusal" "$W/$db.before.json" "/etc/$db"; done
+      assert_snapshot 'backup unchanged on service refusal' "$W/backup-before.json" "$BACKUP_DIR"
+      assert_eq 'active service left untouched on refusal' active "$(cat "$W/active")"
+      assert_false 'disable not attempted after refusal' grep -qx 'systemctl disable xray.service' "$W/events"
+      if [[ "$CASE" == service-foreign-unit ]]; then
+        assert_false 'foreign unit never stopped' grep -qx 'systemctl stop xray.service' "$W/events"
+      fi
+      assert_false 'no filesystem commands after service refusal' test -s "$RB_OBSERVER_RUN/events"
+    else
     rollback
     assert_rc 'rollback after boot activation succeeds' 0 "$RB_RC"
-    assert_observed rm rmdir chmod chown cp mv userdel
+    assert_observed rm rmdir cp mv userdel py-unlink py-rmdir py-fchmod py-fchown
     assert_eq 'service stopped' inactive "$(cat "$W/active")"
     assert_eq 'service disabled' disabled "$(cat "$W/enabled")"
     assert_true 'stop was requested' grep -qx 'systemctl stop xray.service' "$W/events"
@@ -534,6 +585,7 @@ PY
     assert_snapshot 'backup unchanged' "$W/backup-before.json" "$BACKUP_DIR"
     if getent passwd xray >"$W/user-after"; then user_rc=0; else user_rc=$?; fi
     assert_rc 'owned account removed after stop' 2 "$user_rc"
+    fi
     ;;
 esac
 rollback_summary

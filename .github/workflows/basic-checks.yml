@@ -81,7 +81,7 @@ jobs:
           MIFA_NOCHANGE_EXPECT_SANDBOX=1 bash tests/run-docker.sh nochange "${{ matrix.ubuntu }}"
 
   e2e:
-    name: E2E в контейнере с systemd (Ubuntu ${{ matrix.ubuntu }})
+    name: Basic lifecycle E2E (Ubuntu 24.04, disposable systemd container)
     if: >-
       github.event_name == 'workflow_dispatch' &&
       inputs.run_privileged_e2e == true && inputs.disposable_linux_vm == true
@@ -92,11 +92,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ubuntu: ["22.04", "24.04", "26.04"]
+        ubuntu: ["24.04"]
     env:
-      # Первая установка в e2e скачивает Xray сама; публичная цель проверяет
-      # REALITY с настоящим сайтом и выход в интернет через туннель.
-      MIFA_E2E_PUBLIC_SNI: www.microsoft.com
+      # One real Xray lifecycle, using the existing controlled local TLS target.
+      MIFA_E2E_FREEZE_SMOKE: '1'
     steps:
       - name: Require a disposable GitHub-hosted Linux runner
         run: |

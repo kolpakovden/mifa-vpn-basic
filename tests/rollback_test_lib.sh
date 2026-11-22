@@ -55,6 +55,21 @@ make_observer() {
   command -v strace >/dev/null || { echo 'strace required for operation coverage' >&2; return 2; }
   mkdir "$W/observer"
   : >"$W/observer/real-tools"
+  type -P python3 >"$W/observer/python-real" || return 2
+  cat >"$W/observer/systemctl" <<'STOP_WRAPPER'
+#!/usr/bin/env bash
+set -uo pipefail
+"$RB_OBSERVER_SYSTEMCTL" "$@"
+rc=$?
+if [[ "${1:-}" == stop && "$rc" == 0 ]]; then
+  state="$("$RB_OBSERVER_SYSTEMCTL" show -p ActiveState --value xray.service)" || exit 125
+  if [[ "$state" == inactive ]]; then
+    date +%s.%N >>"$RB_OBSERVER_RUN/stopped" || exit 125
+  fi
+fi
+exit "$rc"
+STOP_WRAPPER
+  chmod 0755 "$W/observer/systemctl"
   for tool in rm rmdir unlink cp mv install chmod chown userdel ln mkdir touch truncate; do
     real="$(type -P "$tool")" || return 2
     [[ "$real" == /* ]] || return 2
@@ -82,7 +97,7 @@ observed_rollback() {
   : >"$RB_OBSERVER_RUN/events"
   # -ff avoids interleaved unfinished execve lines. Trace the real executables
   # as well as wrappers, so an absolute-path bypass fails observer validation.
-  if strace -ff -qq -s 4096 -e trace=execve -o "$RB_OBSERVER_RUN/trace" \
+  if strace -ff -qq -ttt -s 4096 -e trace=execve,unlinkat,fchmod,fchown -o "$RB_OBSERVER_RUN/trace" \
       env -u MIFA_BASIC_LIB PATH="$W/observer:$PATH" \
       bash "$INSTALL_SH" --rollback >"$W/rollback.out" 2>&1; then
     RB_RC=0

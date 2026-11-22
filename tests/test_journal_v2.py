@@ -40,6 +40,9 @@ MIFA_BASIC_LIB=1
 . "$INSTALL_LIB"
 set +e +E
 trap - ERR EXIT
+# Temp-journal unit fixtures are outside production's trusted root paths.
+# Parent traversal itself is exercised by disposable Linux regressions.
+txn_restore_parents_safe() { return 0; }
 # Defense in depth: refuse every system mutator if a validation test regresses.
 systemctl() { echo UNEXPECTED_MUTATION >&2; return 99; }
 userdel() { echo UNEXPECTED_MUTATION >&2; return 99; }

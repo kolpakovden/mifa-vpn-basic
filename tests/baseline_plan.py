@@ -23,6 +23,13 @@ V3_SMOKE = [
     "restore-after-replace-interrupted", "staging-symlink",
     "enable-without-stop",
 ]
+BASIC_SMOKE = [
+    "control-remove", "control-restore", "repeat-remove", "repeat-rmdir", "repeat-chmeta", "repeat-userdel",
+    "parent-remove", "parent-rmdir", "parent-chmeta", "leaf-chmeta", "setup-symlink-chmeta",
+    "parent-restore", "backup-parent-restore", "journal-parent-rollback", "backup-setup-parent",
+    "enable-without-stop", "service-stop-failure", "service-foreign-unit",
+    "restore-after-replace-interrupted", "staging-symlink",
+]
 
 
 def boolean(value):
@@ -52,6 +59,8 @@ def select(event_name, ref, event, catalog, push_profile="smoke"):
             cases, profile = P14_CONTROLS + restores + P14_NEGATIVE, "push-p14"
         elif push_profile == "v3-smoke":
             cases, profile = V3_SMOKE[:], "v3-smoke"
+        elif push_profile == "basic-freeze":
+            cases, profile = BASIC_SMOKE[:], "basic-freeze"
         elif push_profile != "smoke":
             raise ValueError("Unknown push baseline profile")
     elif event_name == "workflow_dispatch":

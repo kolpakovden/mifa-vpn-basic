@@ -81,7 +81,7 @@ RB_OBSERVER_SYSTEMCTL="$(type -P systemctl)"
 make_observer
 observed_rollback
 assert_rc 'rollback after activation returns success' 0 "$RB_RC"
-assert_observed rm rmdir chmod chown cp mv userdel
+assert_observed rm rmdir cp mv userdel py-unlink py-rmdir py-fchmod py-fchown
 if state="$(systemctl show -p ActiveState --value xray.service)"; then state_rc=0; else state_rc=$?; fi
 assert_rc 'service state query succeeds' 0 "$state_rc"
 assert_eq 'fixture service is inactive' inactive "$state"

@@ -237,7 +237,7 @@ run_rollback() {
 }
 run_systemd() {
   local script="$1" state='' i rc=0
-  local -a options=() test_env=(-e MIFA_TEST_DISPOSABLE=1)
+  local -a options=() test_env=(-e MIFA_TEST_DISPOSABLE=1 -e "MIFA_E2E_FREEZE_SMOKE=${MIFA_E2E_FREEZE_SMOKE:-0}")
   [[ "$CONFIRM" == --disposable-linux-vm && ( "$SUITE" == e2e || "$SUITE" == rollback-systemd ) ]] \
     || die 'Privileged test not explicitly authorized for this invocation'
   build systemd

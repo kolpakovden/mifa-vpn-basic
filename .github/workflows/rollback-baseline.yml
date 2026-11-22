@@ -63,9 +63,9 @@ jobs:
       - name: Validate event and select scenarios without running installer/tests
         id: catalog
         env:
-          # Fixed 16-case v3 smoke, Ubuntu 24.04 only. Same branch/path/HEAD
+          # Fixed 20-case final Basic smoke, Ubuntu 24.04 only. Same branch/path/HEAD
           # marker opt-in; a push can never select the privileged systemd job.
-          MIFA_BASELINE_PUSH_PROFILE: v3-smoke
+          MIFA_BASELINE_PUSH_PROFILE: basic-freeze
         run: |
           scenarios="$(bash tests/rollback_regressions.sh --list)"
           printf '%s\n' "$scenarios" | python3 tests/baseline_plan.py >> "$GITHUB_OUTPUT"

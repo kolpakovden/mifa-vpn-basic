@@ -11,6 +11,8 @@ MIFA_BASIC_LIB=1
 . "$INSTALL_SH"
 set +e +E
 trap - ERR
+# Only temporary unit fixtures; production parent guards run in Linux regressions.
+txn_restore_parents_safe() { return 0; }
 FIX="${TESTS_DIR}/fixtures"
 
 if [[ -z "${MIFA_TEST_XRAY_BIN:-}" && -n "${MIFA_TEST_XRAY_ZIP:-}" ]] && command -v python3 >/dev/null 2>&1; then
@@ -333,17 +335,25 @@ out="$(run_mock txn_rollback "$RJ")"; rc=$?
 assert_rc "stop не подтверждён: код 3" 3 "$rc"
 assert_contains "пропуск файловых действий" "$out" "1 действий с файлами не выполнялись"
 assert_true "журнал сохранён после блокировки" test -e "$RJ"
-# После подтверждения остановки откат завершается.
+# Legacy service records cannot authorize mutation by name alone.
 printf 'stop\txray.service\t\n' >"$RJ"
 make_mocks inactive disabled loaded
 out="$(run_mock txn_rollback "$RJ")"; rc=$?
-assert_rc "после подтверждения остановки: код 0" 0 "$rc"
+assert_rc "legacy stop без свидетельства unit: код 3" 3 "$rc"
+assert_true "legacy журнал сохранён" test -e "$RJ"
+: >"$RJ"
+out="$(run_mock txn_rollback "$RJ")"; rc=$?
+assert_rc "пустой журнал не требует мутаций службы: код 0" 0 "$rc"
 assert_false "журнал удалён после подтверждения" test -e "$RJ"
 
 t_section "txn_rollback: сбой daemon-reload"
 : >"$RJ"
 make_mocks inactive disabled loaded 1
-out="$(run_mock txn_rollback "$RJ")"; rc=$?
+out="$(
+  # This unit test isolates daemon-reload failure after established ownership.
+  txn_quiesce_service() { RB_SERVICE_MANAGED=1; return 0; }
+  run_mock txn_rollback "$RJ"
+)"; rc=$?
 assert_rc "daemon-reload ошибка: код 3" 3 "$rc"
 assert_contains "daemon-reload сообщение" "$out" "daemon-reload завершился с ошибкой"
 assert_true "журнал сохранён при сбое daemon-reload" test -e "$RJ"

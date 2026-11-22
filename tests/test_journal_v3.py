@@ -287,6 +287,7 @@ MIFA_BASIC_LIB=1
 . "$INSTALL_LIB"
 set +e +E
 trap - ERR EXIT
+txn_restore_parents_safe() { return 0; }
 txn_v3_python() {
   case "$1" in
     status) builtin printf '%s\t%s\tobject\n' "$PHASE" "$KIND" ;;
@@ -350,6 +351,76 @@ exit $?
             rc, events = self.run_case(phase=phase)
             self.assertNotIn("MUTATE", events)
             self.assertEqual(rc, 1 if phase in ("prepared", "cancelled") else 0)
+
+
+@unittest.skipUnless(options.bash, "Bash unavailable")
+class ServicePhase(unittest.TestCase):
+    def exercise(self, owned="1", fail_stop="0"):
+        # Redirect only the unit constant to an owned temp file. All systemd,
+        # receipt verification and undo actions are stubs; never host services.
+        with tempfile.TemporaryDirectory(prefix="mifa-service-order-") as directory:
+            root = Path(directory)
+            unit, fixture, log, state = [root / n for n in ("unit", "journal", "events", "active")]
+            unit.write_text("owned fixture")
+            fixture.write_text("fixture")
+            log.write_text("")
+            state.write_text("active\n")
+            library = root / "installer.sh"
+            library.write_text(SOURCE.replace('readonly XRAY_UNIT="/etc/systemd/system/xray.service"',
+                                               'readonly XRAY_UNIT="$FIXTURE_UNIT"'), encoding="utf-8", newline="\n")
+            env = {k: v for k, v in os.environ.items() if not k.startswith("MIFA_")}
+            env.update(INSTALL_LIB=library.as_posix(), FIXTURE_UNIT=unit.as_posix(), FIXTURE=fixture.as_posix(),
+                       EVENTS=log.as_posix(), ACTIVE=state.as_posix(), OWNED=owned, FAIL_STOP=fail_stop,
+                       MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*")
+            script = r'''
+MIFA_BASIC_LIB=1
+. "$INSTALL_LIB"
+set +e +E
+trap - ERR EXIT
+txn_restore_parents_safe() { return 0; }
+journal_validate() {
+  RB_JOURNAL_VERSION=3
+  RB_JOURNAL_ENTRIES=("$(printf 'owned-remove\t%s\tid' "$XRAY_UNIT")" $'owned-remove\t/usr/local/bin/xray\tbinary')
+}
+txn_systemd_available() { return 0; }
+txn_v3_python() { echo CHECK >>"$EVENTS"; [[ "$1" == check && "$OWNED" == 1 ]]; }
+txn_v3_undo() { echo FILES >>"$EVENTS"; }
+systemctl() {
+  case "$1" in
+    show)
+      case "$*" in
+        *LoadState*) echo loaded ;;
+        *FragmentPath*) echo "$XRAY_UNIT" ;;
+        *DropInPaths*) echo '' ;;
+        *) return 99 ;;
+      esac ;;
+    stop) echo STOP >>"$EVENTS"; [[ "$FAIL_STOP" == 0 ]] || return 1; echo inactive >"$ACTIVE" ;;
+    is-active) cat "$ACTIVE" ;;
+    disable) echo DISABLE >>"$EVENTS" ;;
+    daemon-reload) echo RELOAD >>"$EVENTS" ;;
+    reset-failed) echo RESET >>"$EVENTS" ;;
+    *) return 99 ;;
+  esac
+}
+txn_disable_unit() { systemctl disable xray.service; }
+txn_rollback "$FIXTURE"
+exit $?
+'''
+            result = subprocess.run([options.bash, "-s"], input=script, env=env, capture_output=True,
+                                    text=True, encoding="utf-8", timeout=20)
+            return result.returncode, log.read_text().splitlines(), fixture.exists()
+
+    def test_owned_service_stops_before_every_file_action(self):
+        rc, events, retained = self.exercise()
+        self.assertEqual(rc, 0)
+        self.assertEqual(events, ["CHECK", "STOP", "DISABLE", "FILES", "FILES", "RELOAD", "RESET"])
+        self.assertFalse(retained)
+
+    def test_foreign_service_receipt_cannot_authorize_any_mutation(self):
+        self.assertEqual(self.exercise(owned="0"), (3, ["CHECK"], True))
+
+    def test_failed_stop_blocks_disable_and_files(self):
+        self.assertEqual(self.exercise(fail_stop="1"), (3, ["CHECK", "STOP"], True))
 
 
 if __name__ == "__main__":

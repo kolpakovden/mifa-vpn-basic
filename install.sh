@@ -1186,12 +1186,18 @@ def decode(value):
     except (ValueError, TypeError) as error:
         raise Refuse("invalid JSON: " + str(error))
 
-def parents(path):
+def parents(path, create=False):
     require(path.startswith("/") and posixpath.normpath(path) == path and "//" not in path,
             "non-canonical path")
     fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
         for part in path.split("/")[1:-1]:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                    os.fsync(fd)
+                except FileExistsError:
+                    pass
             next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = next_fd
@@ -1391,6 +1397,10 @@ def main():
     cmd, *a = sys.argv[1:]
     if cmd == "id":
         print(secrets.token_hex(16)); return
+    if cmd == "backup-parent":
+        require(a[0].startswith("/var/backups/mifa-vpn-basic/install-"), "invalid backup path")
+        p, _ = parents(a[0], create=True)
+        os.fsync(p); os.close(p); return
     if cmd == "validate":
         _, rows = validate(a[0]); print("\n".join(rows)); return
     if cmd == "spec":
@@ -1587,6 +1597,7 @@ journal_undo() {
 journal_append() {
   local journal="$1" action="$2" dest="$3" arg="$4"
   [[ -f "$journal" && ! -L "$journal" ]] || return 1
+  txn_restore_parents_safe "$journal" || return 1
   printf '%s\t%s\t%s\n' "$action" "$dest" "$arg" >>"$journal" || return 1
   # A failed flush is a failed write for the protocol. Never authorize a
   # destination replacement merely because the line is visible in page cache.
@@ -1608,7 +1619,9 @@ test_fault() {
 txn_begin() {
   local created=0
   command -v python3 >/dev/null 2>&1 || { err 'Journal v3 требует python3'; return 1; }
+  txn_restore_parents_safe "$STATE_DIR" || return 1
   [[ ! -L "$STATE_DIR" && ( ! -e "$STATE_DIR" || -d "$STATE_DIR" ) ]] || return 1
+  if [[ -d "$STATE_DIR" ]]; then txn_restore_parents_safe "$JOURNAL" || return 1; fi
   [[ ! -e "$JOURNAL" && ! -L "$JOURNAL" ]] || return 1
   if [[ ! -d "$STATE_DIR" ]]; then
     created=1
@@ -1625,10 +1638,13 @@ txn_begin() {
 
 backup_path() {
   local p="$1" dest
-  install -d -m 0700 "$BACKUP_ROOT" "$BACKUP_DIR"
+  txn_restore_parents_safe "$p" && [[ -f "$p" && ! -L "$p" ]] || return 1
   dest="${BACKUP_DIR}${p}"
-  mkdir -p -- "$(dirname "$dest")"
-  cp -a -- "$p" "$dest"
+  txn_v3_python backup-parent "$dest" || return 1
+  txn_restore_parents_safe "$dest" && [[ ! -e "$dest" && ! -L "$dest" ]] || return 1
+  cp -a -T --no-clobber -- "$p" "$dest" || return 1
+  txn_restore_matches "$p" "$dest" || return 1
+  sync "$dest" "$(dirname "$dest")" 2>/dev/null || return 1
   BACKUP_PATH="$dest"
   info "Резервная копия: ${p} -> ${dest}"
 }
@@ -1659,7 +1675,7 @@ txn_install_file() {
     txn_mkdir "$(dirname "$dest")" 0755 root root || return 1
   fi
   if [[ -e "$dest" || -L "$dest" ]]; then
-    backup_path "$dest"
+    backup_path "$dest" || return 1
     journal_undo restore "$dest" "$BACKUP_PATH" || return 1
   else
     txn_v3_prepare remove "$dest" || return 1
@@ -1671,6 +1687,12 @@ txn_install_file() {
   tmp_id="$V3_ID"
   txn_v3_python create-file "$JOURNAL" "$tmp_id" "$src" "$mode" "$owner" "$group" || return 1
   txn_v3_ready "$tmp_id" || return 1
+  txn_restore_parents_safe "$dest" || return 1
+  if [[ -n "$dest_id" ]]; then
+    [[ ! -e "$dest" && ! -L "$dest" ]] || return 1
+  else
+    txn_restore_types_safe "$dest" "$BACKUP_PATH" && txn_restore_matches "$BACKUP_PATH" "$dest" || return 1
+  fi
   mv -fT -- "$tmp" "$dest" || return 1
   sync "$dest" "$(dirname "$dest")" 2>/dev/null || return 1
   if [[ -n "$dest_id" ]]; then txn_v3_ready "$dest_id" || return 1; fi
@@ -2025,6 +2047,48 @@ txn_disable_unit() {
   return 1
 }
 
+# No new service journal protocol: the v3 unit-file receipt proves ownership.
+# A missing/changed receipt never authorizes stopping another installation.
+txn_quiesce_service() {
+  local journal="$1" entry action path id unit_id='' needed=0 state load enabled fragment dropins
+  RB_SERVICE_MANAGED=0
+  RB_SERVICE_RELOAD=0
+  for entry in "${RB_JOURNAL_ENTRIES[@]}"; do
+    IFS=$'\t' read -r action path id <<<"$entry"
+    case "$action:$path" in
+      owned-remove:"$XRAY_UNIT") unit_id="$id"; needed=1 ;;
+      stop:"$XRAY_SERVICE"|disable:"$XRAY_SERVICE"|restore:"$XRAY_UNIT") needed=1 ;;
+    esac
+  done
+  (( needed )) || return 0
+  txn_systemd_available || { warn 'systemd недоступен: файловый откат запрещён'; return 1; }
+  [[ -n "$unit_id" ]] || { warn 'Нет v3-свидетельства принадлежности unit: служба не изменена'; return 1; }
+  if [[ -e "$XRAY_UNIT" || -L "$XRAY_UNIT" ]]; then
+    txn_v3_python check "$journal" "$unit_id" || return 1
+    load="$(systemctl show -p LoadState --value "$XRAY_SERVICE")" || return 1
+    fragment="$(systemctl show -p FragmentPath --value "$XRAY_SERVICE")" || return 1
+    dropins="$(systemctl show -p DropInPaths --value "$XRAY_SERVICE")" || return 1
+    [[ -z "$dropins" && ( "$fragment" == "$XRAY_UNIT" || ( "$load" == not-found && -z "$fragment" ) ) ]] \
+      || { warn 'Загруженный Xray/unit overrides не подтверждены как принадлежащие транзакции'; return 1; }
+    txn_stop_unit "$XRAY_SERVICE" && txn_disable_unit "$XRAY_SERVICE" || return 1
+    RB_SERVICE_MANAGED=1
+    return 0
+  fi
+  txn_v3_python absent "$journal" "$unit_id" || return 1
+  state="$(systemctl show -p ActiveState --value "$XRAY_SERVICE")" || return 1
+  load="$(systemctl show -p LoadState --value "$XRAY_SERVICE")" || return 1
+  enabled="$(systemctl show -p UnitFileState --value "$XRAY_SERVICE")" || return 1
+  fragment="$(systemctl show -p FragmentPath --value "$XRAY_SERVICE")" || return 1
+  dropins="$(systemctl show -p DropInPaths --value "$XRAY_SERVICE")" || return 1
+  # Previous rollback may have removed the unit. Verify only, without stop or
+  # disable by a now unowned name. Active/unknown service requires manual work.
+  [[ "$state" == inactive || "$state" == failed ]] || return 1
+  [[ -z "$dropins" && ( "$fragment" == "$XRAY_UNIT" || ( "$load" == not-found && -z "$fragment" ) ) ]] || return 1
+  case "$enabled" in disabled|not-found) ;; *) [[ "$load" == not-found && -z "$enabled" ]] || return 1 ;; esac
+  RB_SERVICE_RELOAD=1
+  return 0
+}
+
 txn_rollback() {
   local journal="${1:-$JOURNAL}" i action a1 a2 entry rmstate=0 rc=0 blocked=0 skipped=0 leftover=""
   local -a entries=()
@@ -2035,7 +2099,7 @@ txn_rollback() {
     return 0
   fi
   # Ошибка чтения журнала: ни одно действие не выполняется, журнал сохраняется.
-  if [[ ! -f "$journal" || -L "$journal" || ! -r "$journal" ]]; then
+  if [[ ! -f "$journal" || -L "$journal" || ! -r "$journal" ]] || ! txn_restore_parents_safe "$journal"; then
     TXN_ACTIVE=0
     warn "Не удалось прочитать журнал ${journal}: ни одно действие отката не выполнено"
     warn "Журнал и резервные копии в ${BACKUP_ROOT} сохранены; устраните причину и повторите: sudo bash install.sh --rollback"
@@ -2055,13 +2119,7 @@ txn_rollback() {
   done
   # Фаза 1: сервис. Пока остановка и отключение не подтверждены, файловые
   # действия не выполняются - независимо от порядка записей в журнале.
-  for entry in "${entries[@]}"; do
-    IFS=$'\t' read -r action a1 a2 <<<"$entry"
-    case "$action" in
-      stop)    txn_stop_unit "$a1"    || { rc=1; blocked=1; } ;;
-      disable) txn_disable_unit "$a1" || { rc=1; blocked=1; } ;;
-    esac
-  done
+  txn_quiesce_service "$journal" || { rc=1; blocked=1; }
   # Фаза 2: файлы, права, пользователь и каталоги.
   for entry in "${entries[@]}"; do
     IFS=$'\t' read -r action a1 a2 <<<"$entry"
@@ -2082,14 +2140,16 @@ txn_rollback() {
   done
   if (( blocked )); then
     warn "Откат прерван: ${XRAY_SERVICE} не подтверждён остановленным и отключённым, ${skipped} действий с файлами не выполнялись"
+    TXN_ACTIVE=0
+    return "$RC_ROLLBACK_INCOMPLETE"
   fi
   # daemon-reload обязателен после изменения unit-файлов.
-  if txn_systemd_available; then
+  if (( RB_SERVICE_MANAGED || ${RB_SERVICE_RELOAD:-0} )) && txn_systemd_available; then
     if ! systemctl daemon-reload >/dev/null 2>&1; then
       warn "systemctl daemon-reload завершился с ошибкой: изменения unit-файлов не применены"
       rc=1
     fi
-    systemctl reset-failed "$XRAY_SERVICE" >/dev/null 2>&1 || true
+    if (( RB_SERVICE_MANAGED )); then systemctl reset-failed "$XRAY_SERVICE" >/dev/null 2>&1 || true; fi
   fi
   TXN_ACTIVE=0
   # Каталог состояния после отката должен содержать только журнал.
@@ -2302,10 +2362,10 @@ do_install() {
   txn_install_file "${WORKDIR}/xray.service" "$XRAY_UNIT" 0644 root root
   test_fault after_unit
   systemctl daemon-reload
+  journal_undo stop "$XRAY_SERVICE"
   journal_undo disable "$XRAY_SERVICE"
   systemctl enable "$XRAY_SERVICE" >/dev/null 2>&1 || die "systemctl enable ${XRAY_SERVICE} завершился с ошибкой"
   test_fault after_enable
-  journal_undo stop "$XRAY_SERVICE"
   if ! systemctl start "$XRAY_SERVICE"; then
     show_service_diagnostics
     die "systemctl start ${XRAY_SERVICE} завершился с ошибкой"

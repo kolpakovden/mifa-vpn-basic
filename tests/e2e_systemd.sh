@@ -19,6 +19,13 @@ T_NAME="e2e"
 . "$(dirname "$0")/lib.sh"
 require_disposable
 [[ -d /run/systemd/system ]] || { echo "Нужен контейнер с systemd" >&2; exit 2; }
+for p in /usr/local/bin/xray /usr/local/etc/xray /etc/systemd/system/xray.service /var/lib/mifa-vpn-basic /var/backups/mifa-vpn-basic; do
+  [[ ! -e "$p" && ! -L "$p" ]] || { echo "Fresh disposable container required: $p" >&2; exit 2; }
+done
+if getent passwd xray >/dev/null || getent group xray >/dev/null; then
+  echo 'Fresh disposable container required: xray account/group exists' >&2; exit 2
+fi
+[[ "$(systemctl show -p LoadState --value xray.service)" == not-found ]] || exit 2
 
 W="$(mktemp -d)"
 PIDS=()
@@ -166,6 +173,34 @@ EOF
 }
 
 # --- Режимы без изменений на чистой системе ----------------------------------
+if [[ "${MIFA_E2E_FREEZE_SMOKE:-0}" == 1 ]]; then
+  t_section "Basic freeze: Xray connection, interrupted installation, rollback, reinstall"
+  out="$(MIFA_BASIC_TEST_MODE=1 MIFA_BASIC_TEST_FAIL_AT=before_commit:kill bash "$INSTALL_SH" "${BASE[@]}" "${SRC[@]}" 2>&1)"; rc=$?
+  assert_rc 'installer killed before commit' 137 "$rc"
+  [[ "$rc" == 137 ]] || abort 'expected installer SIGKILL did not happen' "$out"
+  assert_contains 'exact fault point was reached' "$out" 'Тестовый SIGKILL на шаге before_commit'
+  assert_true 'unfinished journal exists' test -f /var/lib/mifa-vpn-basic/journal.inprogress
+  assert_true 'real Xray service remains active after installer death' systemctl is-active --quiet xray.service
+  res="$(client_fetch "$CLIENT_FILE" "http://${DEST_IP}:8080/marker.txt")"; rc=$?
+  assert_rc 'first real VLESS/REALITY request succeeds' 0 "$rc"
+  assert_eq 'first tunnel response' "$MARKER" "$res"
+  out="$(bash "$INSTALL_SH" --rollback 2>&1)"; rc=$?
+  assert_rc 'emergency rollback succeeds' 0 "$rc"
+  [[ "$rc" == 0 ]] || abort 'rollback failed; no reinstall attempted' "$out"
+  assert_clean_host 'after emergency rollback'
+  assert_false 'unfinished journal removed' test -e /var/lib/mifa-vpn-basic/journal.inprogress
+  assert_false 'private group removed' getent group xray
+  out="$(bash "$INSTALL_SH" "${BASE[@]}" "${SRC[@]}" 2>&1)"; rc=$?
+  assert_rc 'fresh reinstall succeeds' 0 "$rc"
+  [[ "$rc" == 0 ]] || abort 'reinstall failed' "$out"
+  assert_true 'reinstalled service is active' systemctl is-active --quiet xray.service
+  res="$(client_fetch "$CLIENT_FILE" "http://${DEST_IP}:8080/marker.txt")"; rc=$?
+  assert_rc 'reinstalled VLESS/REALITY request succeeds' 0 "$rc"
+  assert_eq 'reinstalled tunnel response' "$MARKER" "$res"
+  t_summary
+  exit $?
+fi
+
 t_section "preflight/plan/dry-run на чистой системе с systemd"
 out="$(bash "$INSTALL_SH" --preflight "${BASE[@]}" "${SRC[@]}" 2>&1)"; rc=$?
 assert_rc "preflight проходит (код 0)" 0 "$rc"

@@ -5,6 +5,7 @@ Never imports installer implementation.
 """
 import ast
 import collections
+import decimal
 import hashlib
 import json
 import os
@@ -76,11 +77,25 @@ def check_observer(run_dir, observer_dir, required):
                    (Path(observer_dir) / "real-tools").read_text().splitlines())
     actual = collections.Counter()
     wrappers = collections.Counter()
+    descriptors = collections.Counter()
+    descriptor_times = []
+    python_file = Path(observer_dir) / "python-real"
+    python_real = os.path.realpath(python_file.read_text().strip()) if python_file.exists() else None
     traces = list(run.glob("trace.*"))
     if not traces:
         raise ProbeInfrastructureError("No strace output: observer was not exercised")
     for trace in traces:
-        for line in trace.read_text().splitlines():
+        python_process = False
+        for raw in trace.read_text().splitlines():
+            stamp = re.match(r"^(\d+\.\d+) (.*)$", raw)
+            line = stamp[2] if stamp else raw
+            if python_process and re.match(r"^(unlinkat|fchmod|fchown)\(", line):
+                if not stamp or not re.search(r"\)\s+= (?:0|-1 \w+.*)$", line):
+                    raise ProbeInfrastructureError("Incomplete descriptor syscall observation")
+                kind = "py-rmdir" if line.startswith("unlinkat(") and "AT_REMOVEDIR" in line else \
+                       "py-unlink" if line.startswith("unlinkat(") else "py-" + line.split("(", 1)[0]
+                descriptors[kind] += 1
+                descriptor_times.append(decimal.Decimal(stamp[1]))
             if not line.startswith("execve("):
                 continue
             match = re.match(r'execve\(("(?:[^"\\]|\\.)*"),.*\)\s+= 0$', line)
@@ -91,6 +106,7 @@ def check_observer(run_dir, observer_dir, required):
                     continue
                 raise ValueError(f"Unparsed execve: {line}")
             executable = ast.literal_eval(match.group(1))
+            python_process = python_real is not None and os.path.realpath(executable) == python_real
             for tool, real in mapping.items():
                 if (Path(executable).name == tool
                         and os.path.realpath(executable) == os.path.realpath(real)):
@@ -99,6 +115,16 @@ def check_observer(run_dir, observer_dir, required):
                     wrappers[tool] += 1
     events = collections.Counter()
     safe = True
+    if descriptor_times:
+        stopped = run / "stopped"
+        if not stopped.exists():
+            print("Python filesystem mutation without a confirmed stop barrier", file=sys.stderr)
+            safe = False
+        else:
+            barriers = [decimal.Decimal(t) for t in stopped.read_text().splitlines()]
+            if not barriers or min(descriptor_times) <= min(barriers):
+                print("Python filesystem mutation preceded confirmed stop", file=sys.stderr)
+                safe = False
     for line in (run / "events").read_text().splitlines():
         tool, state = line.split("\t")
         events[tool] += 1
@@ -111,7 +137,7 @@ def check_observer(run_dir, observer_dir, required):
               f"events={events}", file=sys.stderr)
         safe = False
     for tool in required:
-        if events[tool] == 0:
+        if (descriptors if tool.startswith("py-") else events)[tool] == 0:
             print(f"Expected operation was not observed: {tool}", file=sys.stderr)
             safe = False
     return safe

@@ -78,6 +78,8 @@ def main():
         target_expected = "FAIL" if scenario in ("repeat-remove", "parent-chmeta", "enable-without-stop") else "PASS"
     elif profile == "v3-smoke":
         target_expected = "FAIL" if scenario == "enable-without-stop" else "PASS"
+    elif profile == "basic-freeze":
+        target_expected = "PASS"
     report.update(ubuntu=ubuntu, scenario=scenario, expected_before_fixes=expected,
                   expected_this_run=target_expected,
                   runner_exit_code=runner_rc, log_exit_code=log_rc,
@@ -104,11 +106,11 @@ def main():
         "inspect individual assertions before claiming defect reproduction. Infrastructure errors, "
         "missing/contradictory summaries and timeouts are not reproduced defects.\n"
     )
-    if profile == "v3-smoke" and scenario == "enable-without-stop":
+    if profile in ("v3-smoke", "basic-freeze") and scenario == "enable-without-stop":
         summary += (
-            "\nKnown observer limit: execve coverage excludes Python descriptor filesystem operations. "
-            "Inspect the independent ActiveState/stop assertions for P1-5; missing external "
-            "chmod/chown/rmdir observations alone do not reproduce that defect.\n"
+            "\nObserver checks external commands and Python descriptor syscall timestamps against "
+            "the confirmed stop barrier. ActiveState and stop assertions are checked independently. "
+            "This is not a general concurrent-root or power-loss guarantee.\n"
         )
     (output / "summary.md").write_text(summary, encoding="utf-8")
     print(summary)
