@@ -58,4 +58,4 @@ sudo bash install.sh --sni YOUR_DOMAIN --port 443
 
 **Документация:** [Восстановление](docs/RECOVERY.md) · [История изменений](CHANGELOG.md) · [Релизы](https://github.com/kolpakovden/mifa-vpn-basic/releases)
 
-**Лицензия:** [MIFA Free Noncommercial License 1.0](LICENSE) - бесплатное некоммерческое использование. Ранее предоставленные права MIT сохраняются для соответствующих материалов. Проект предоставляется без гарантий.
+**Лицензия:** [MIFA Free Noncommercial License 1.1](LICENSE) - бесплатное некоммерческое использование. Ранее предоставленные права MIT сохраняются для соответствующих материалов. Проект предоставляется без гарантий.
