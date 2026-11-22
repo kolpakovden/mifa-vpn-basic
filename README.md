@@ -1,6 +1,6 @@
 ## MIFA VPN Basic
 
-![Version](https://img.shields.io/badge/version-v1.1.0-blue)
+![Version](https://img.shields.io/badge/version-v1.1.1-blue)
 [![License](https://img.shields.io/badge/license-Free_Noncommercial-blue)](LICENSE)
 
 Простой установщик **Xray (VLESS + REALITY)** для чистого VPS с Ubuntu **22.04 / 24.04 / 26.04** (x86_64 и ARM64).
